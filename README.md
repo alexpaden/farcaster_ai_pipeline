@@ -2,28 +2,44 @@
 
 High-performance embedding generation pipeline for Farcaster casts using optimized MiniLM-L6-v2.
 
-## Model Details
+## Architecture
 
-- Model: `sentence-transformers/all-MiniLM-L6-v2`
-- Embedding Size: 384 dimensions
-- Quantization: int8 (production storage)
-- Performance: ~85-90% of OpenAI ada-002 for semantic search tasks
-- Batch Size: 256 (optimized)
-- Instances: Dynamic scaling up to 48 (production configuration)
+### Core Modules (`src/embedding384/`)
 
-## Performance Metrics
+- `model.py` - Optimized MiniLM-L6-v2 with TorchScript, float16, and buffer pre-allocation
+- `pipeline.py` - Dynamic scaling pipeline with workload-based instance management
+- `benchmark.py` - Performance testing and optimization framework
 
-- Processing Speed: ~75k texts/second with dynamic scaling
-- Memory Usage: ~1.3GB per instance
-- Total Memory: ~62GB at full load (48 instances)
-- Estimated Processing Time for 200M casts: ~45 minutes
+### Database (`src/db/`)
+
+- PostgreSQL with pgvector extension
+- Optimized connection pooling and transaction management
+- Efficient batch operations with SKIP LOCKED
+- Error tracking and automatic retries
+
+## Features
+
+- Dynamic scaling from 1-48 instances based on workload (1 instance per 10k texts)
+- TorchScript optimization with float16 precision on MPS
+- Pre-allocated buffers for minimal memory overhead
+- Fixed 256 batch size (optimized for M-series chips)
+- Efficient connection pooling with asyncpg
+
+## Performance
+
+- Processing Speed: ~50k texts/second with 48 instances
+- Memory Usage: ~2GB per instance
+- Total Memory: ~96GB at full load (48 instances)
+- Batch Size: 256 (optimized for MPS)
+- Estimated Processing Time for 200M casts: ~67 minutes
 
 ## Requirements
 
 - PostgreSQL 15+ with pgvector extension
 - Python 3.9+
-- PyTorch 2.0+
-- Apple Silicon Mac (M1/M2/M3) for MPS acceleration
+- PyTorch 2.0+ with MPS support
+- Apple Silicon Mac (M1/M2/M3)
+- 128GB RAM recommended for full scaling
 
 ## Setup
 
@@ -34,75 +50,69 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-2. Set up database:
-```bash
-psql -f sql/schema.sql
-```
-
-3. Configure environment:
+2. Configure environment:
 ```bash
 cp .env.example .env
 # Edit .env with your database credentials
 ```
 
+3. Run migrations:
+```bash
+python src/main.py --migrate-only
+```
+
 ## Usage
 
-### Run Pipeline
+### Production Pipeline
 ```bash
-# Run migrations only
-python src/main.py --migrate-only
-
-# Run full pipeline
+# Run full pipeline with dynamic scaling
 python src/main.py
 
-# Run in test mode
-python src/main.py --test
+# Run benchmark tests
+python -m src.embedding384.benchmark
+```
 
-# Resume from specific cast ID
-python src/main.py --start-id <cast_id>
+### Benchmark Results
+
+Sample benchmark output with 256 batch size:
+```
+Instances: 1,  TPS: 1.2k,  Memory: 2.1GB
+Instances: 6,  TPS: 7.1k,  Memory: 12.6GB
+Instances: 36, TPS: 42.3k, Memory: 75.6GB
 ```
 
 ## Database Schema
 
-- Test Table: `public.test_casts`
-  - For benchmarking and testing
-  - 100k sample casts
-  - IVF index with 100 lists
-  - Includes embedding column (384d int8)
+### Production Table (`public.casts`)
+```sql
+CREATE TABLE casts (
+    cast_id BIGINT PRIMARY KEY,
+    text TEXT,
+    embedding vector(384),
+    embedding_updated_at TIMESTAMP WITH TIME ZONE
+);
 
-- Production Table: `public.casts`
-  - Full cast history
-  - 384d int8 embeddings
-  - IVF index with 1000 lists
-  - Optimized for high-throughput updates
+CREATE INDEX idx_casts_unprocessed ON casts (cast_id) 
+WHERE embedding IS NULL AND text IS NOT NULL;
+```
 
-## Architecture
-
-- Modular SQL operations in `sql/` directory
-- Dynamic instance scaling based on throughput
-- Warm-up phase for optimal performance
-- Batched database operations
-- Efficient memory management
-
-## Performance Tuning
-
-- Dynamic Instance Scaling: 1-48 instances
-- Batch Size: 256 (optimal for MPS)
-- Memory per Instance: ~1.3GB
-- Database Indexing: IVF for fast similarity search
-- Warm-up phase for consistent performance
-
-## Use Cases
-
-1. In-thread Semantic Search
-2. Reply Classification
-3. Cast Clustering
-4. Similar Cast Discovery
+### Test Table (`public.test_casts`)
+- Mirror of production schema
+- Used for benchmarking and testing
+- Smaller dataset (100k rows)
 
 ## Monitoring
 
-Monitor memory usage with Activity Monitor:
-- Peak Memory: ~1.3GB per instance under load
-- Total Memory: ~62GB at max instances (48)
-- GPU Memory: Managed by MPS
-- Dynamic scaling based on throughput metrics
+- Dynamic scaling events
+- Memory usage per instance
+- Processing throughput
+- Database operation latencies
+- Error tracking and retries
+
+## Architecture Notes
+
+- Optimized for Apple Silicon with MPS backend
+- Efficient memory management with pre-allocated buffers
+- Dynamic scaling based on unprocessed workload
+- Safe database operations with SKIP LOCKED
+- Clean separation of concerns between modules

@@ -1,9 +1,17 @@
+"""
+Database connection management with connection pooling and migrations.
+"""
+
 import os
 import logging
 import psycopg2
+import asyncpg
 from psycopg2.extras import DictCursor
 from dotenv import load_dotenv
 from contextlib import contextmanager
+from typing import List, Dict, Any
+from pathlib import Path
+import glob
 from .logger import setup_logging
 
 # Load environment variables
@@ -22,7 +30,60 @@ class DatabaseConnection:
             'port': os.getenv('DB_PORT')
         }
         self._conn = None
+        self._pool = None
         self._test_connection()
+
+    async def run_migrations(self, module_path: str = None):
+        """Run migrations in order, optionally for a specific module."""
+        print("\nRunning migrations...")
+        
+        # Get all migration files
+        migration_paths = []
+        
+        # Global migrations first
+        global_migrations = sorted(glob.glob(str(Path(__file__).parent / "migrations" / "*.sql")))
+        migration_paths.extend(global_migrations)
+        
+        # Module-specific migrations if specified
+        if module_path:
+            module_migrations = sorted(glob.glob(str(Path(module_path) / "migrations" / "*.sql")))
+            migration_paths.extend(module_migrations)
+        
+        # Create migrations table if it doesn't exist
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS migrations (
+                    id SERIAL PRIMARY KEY,
+                    filename TEXT NOT NULL UNIQUE,
+                    module TEXT,
+                    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
+            
+            # Get already applied migrations
+            applied = set(await conn.fetch("SELECT filename FROM migrations"))
+            applied = {row['filename'] for row in applied}
+            
+            # Apply new migrations in order
+            for path in migration_paths:
+                filename = os.path.basename(path)
+                if filename not in applied:
+                    print(f"Applying migration: {filename}")
+                    
+                    # Read and execute migration
+                    with open(path, 'r') as f:
+                        sql = f.read()
+                        await conn.execute(sql)
+                    
+                    # Record migration
+                    module = os.path.basename(os.path.dirname(os.path.dirname(path))) if module_path else None
+                    await conn.execute(
+                        "INSERT INTO migrations (filename, module) VALUES ($1, $2)",
+                        filename, module
+                    )
+                    print(f"Applied migration: {filename}")
+        
+        print("Migrations complete.")
 
     def _test_connection(self):
         """Test the database connection with the provided parameters."""
@@ -37,7 +98,7 @@ class DatabaseConnection:
 
     @contextmanager
     def get_connection(self):
-        """Get a database connection with error handling."""
+        """Get a synchronous database connection with error handling."""
         if self._conn is None:
             try:
                 self._conn = psycopg2.connect(**self.db_params)
@@ -59,7 +120,7 @@ class DatabaseConnection:
 
     @contextmanager
     def get_cursor(self, cursor_factory=DictCursor):
-        """Get a database cursor with error handling."""
+        """Get a synchronous database cursor with error handling."""
         with self.get_connection() as conn:
             cursor = conn.cursor(cursor_factory=cursor_factory)
             try:
@@ -72,12 +133,84 @@ class DatabaseConnection:
             finally:
                 cursor.close()
 
+    async def initialize_pool(self):
+        """Initialize the asyncpg connection pool."""
+        if self._pool is None:
+            try:
+                self._pool = await asyncpg.create_pool(
+                    database=self.db_params['dbname'],
+                    user=self.db_params['user'],
+                    password=self.db_params['password'],
+                    host=self.db_params['host'],
+                    port=self.db_params['port'],
+                    min_size=2,  # Minimum connections per process
+                    max_size=4,  # Maximum connections per process
+                    command_timeout=60,
+                    server_settings={
+                        'application_name': f'farcaster_ai_pipeline_{os.getpid()}'
+                    }
+                )
+                logger.debug("Created new asyncpg connection pool")
+            except Exception as e:
+                logger.error(f"Error creating asyncpg pool: {str(e)}")
+                raise
+        return self._pool
+
+    @property
+    def pool(self):
+        """Get the asyncpg connection pool."""
+        if self._pool is None:
+            raise RuntimeError("Pool not initialized. Call initialize_pool() first.")
+        return self._pool
+
+    async def get_pool(self):
+        """Get or create an asyncpg connection pool."""
+        if self._pool is None:
+            await self.initialize_pool()
+        return self._pool
+
+    async def close_pool(self):
+        """Close the asyncpg connection pool."""
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+            logger.debug("Closed asyncpg connection pool")
+
     def close(self):
-        """Close the database connection."""
+        """Close all database connections."""
         if self._conn is not None:
             self._conn.close()
             self._conn = None
-            logger.debug("Closed database connection")
+            logger.debug("Closed synchronous database connection")
+
+    # Benchmark-specific methods
+    async def reset_test_casts(self):
+        """Reset and populate test_casts table with 100k casts."""
+        print("\nResetting test_casts table...")
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                TRUNCATE TABLE public.test_casts;
+                
+                INSERT INTO public.test_casts (id, text)
+                SELECT id, text
+                FROM public.casts
+                WHERE text IS NOT NULL 
+                AND length(trim(text)) > 0
+                ORDER BY id
+                LIMIT 100000;
+            """)
+        print("Test casts table reset complete.")
+
+    async def fetch_test_batch(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Fetch a batch of test casts."""
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT id, text 
+                FROM public.test_casts 
+                ORDER BY id
+                LIMIT $1
+            """, limit)
+            return [dict(row) for row in rows]
 
 # Create a singleton instance
 db = DatabaseConnection() 
