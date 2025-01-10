@@ -18,6 +18,7 @@ import multiprocessing
 import json
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -55,6 +56,9 @@ class EmbeddingPipeline:
             command_timeout=60
         )
         
+        # Run migrations first
+        await self._run_migrations()
+        
         # Initialize model
         logger.info("Initializing model on MPS...")
         self.model = SentenceTransformer(
@@ -77,6 +81,37 @@ class EmbeddingPipeline:
         # Log initial memory usage
         memory_mb = self.process.memory_info().rss / 1024 / 1024
         logger.info(f"Initial memory usage: {memory_mb:.1f}MB")
+
+    async def _run_migrations(self):
+        """Run all numbered migrations in order."""
+        migrations_dir = Path("src/db/migrations")
+        if not migrations_dir.exists():
+            logger.warning(f"Migrations directory not found: {migrations_dir}")
+            return
+
+        # Get all numbered migration files
+        migration_files = []
+        for file in migrations_dir.glob("[0-9]*.sql"):
+            # Extract migration number from filename
+            if match := re.match(r"(\d+)_.*\.sql", file.name):
+                number = int(match.group(1))
+                migration_files.append((number, file))
+
+        # Sort by migration number
+        migration_files.sort(key=lambda x: x[0])
+        
+        # Run each migration in order
+        async with self.pool.acquire() as conn:
+            for number, file in migration_files:
+                logger.info(f"Running migration {file.name}")
+                try:
+                    with open(file) as f:
+                        sql = f.read()
+                        await conn.execute(sql)
+                    logger.info(f"Completed migration {file.name}")
+                except Exception as e:
+                    logger.error(f"Error in migration {file.name}: {str(e)}")
+                    raise
 
     def get_memory_usage(self) -> float:
         """Get current memory usage in MB."""
@@ -253,36 +288,7 @@ class EmbeddingPipeline:
             
             # Calculate throughput and adjust instances
             duration = asyncio.get_event_loop().time() - start_time
-            total_processed = len(batches) * self.batch_size
-            throughput = total_processed / duration
+            throughput = len(rows) / duration
             self._adjust_instances(throughput)
             
-            logger.info(f"Processed {total_processed} casts at {throughput:.0f} texts/second with {self.current_instances} instances")
-    
-    def _adjust_instances(self, throughput: float):
-        """Dynamically adjust number of instances based on throughput."""
-        # Target 75k texts/second with each instance handling ~2k texts/sec
-        target_tps = 75000  # Target total texts per second
-        instance_tps = 2000  # Expected texts per second per instance
-        
-        # Calculate needed instances to reach target
-        needed_instances = int(target_tps / instance_tps)
-        
-        # If current throughput is below target, scale more aggressively
-        if throughput < target_tps:
-            # Scale up by 2x the calculated need
-            target = min(needed_instances * 2, self.max_instances)
-        else:
-            # We're at or above target, maintain current scaling
-            target = min(needed_instances, self.max_instances)
-        
-        # Always ensure at least one instance
-        target = max(1, target)
-        
-        if target != self.current_instances:
-            prev_instances = self.current_instances
-            self.current_instances = target
-            logger.info(
-                f"Adjusted instances: {prev_instances} -> {self.current_instances} "
-                f"(throughput: {throughput:.0f} texts/sec, target: {target_tps})"
-            )
+            logger.info(f"Processed {len(rows)} casts at {throughput:.0f} texts/second")
