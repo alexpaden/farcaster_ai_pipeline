@@ -91,7 +91,7 @@ class DatabaseConnection:
             with self.get_connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute('SELECT 1')
-            logger.info("Database connection test successful")
+            #logger.info("Database connection test successful")
         except Exception as e:
             logger.error(f"Database connection test failed: {str(e)}")
             raise

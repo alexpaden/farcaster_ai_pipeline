@@ -4,6 +4,13 @@ Tests performance across different batch sizes (128, 256, 512, 1024) with both s
 Uses TorchScript optimization and float16 precision on MPS.
 """
 
+# Configuration settings
+BATCH_SIZE = 256  # Optimal batch size for MPS
+NUM_PROCESSES = 12  # Number of parallel processes
+TEST_SAMPLE_SIZE = 100000  # Number of test casts to sample
+MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization (model max is 256)
+
 import os
 import warnings
 import sys
@@ -54,23 +61,20 @@ class BenchmarkMetrics:
         }
 
 class OptimizedEmbeddingModel:
-    def __init__(self, batch_size: int):
+    def __init__(self, batch_size: int, quiet: bool = False):
         self.device = torch.device("mps")
         self.batch_size = batch_size
-        self.model_name = "sentence-transformers/all-MiniLM-L6-v2"
+        self.model_name = MODEL_NAME
+        self.quiet = quiet
         
-        # Initialize model with optimizations
-        print(f"\nInitializing model with batch_size={batch_size} on MPS...")
+        if not quiet:
+            print(f"\nInitializing model with batch_size={batch_size} on MPS...")
         self._initialize_model()
         
     def _initialize_model(self):
-        # Use all CPU cores
         torch.set_num_threads(multiprocessing.cpu_count())
-        
-        # Force garbage collection
         gc.collect()
         
-        # Load model in float16
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         base_model = AutoModel.from_pretrained(
             self.model_name,
@@ -80,17 +84,15 @@ class OptimizedEmbeddingModel:
         base_model.to(self.device)
         base_model.eval()
         
-        # Initialize with longer sample text
         sample_texts = ["This is a longer initialization text that will ensure adequate buffer sizes"] * 32
         inputs = self.tokenizer(
             sample_texts,
             padding=True,
             truncation=True,
-            max_length=128,
+            max_length=MAX_SEQ_LENGTH,
             return_tensors="pt"
         ).to(self.device)
         
-        # TorchScript optimization
         with torch.inference_mode():
             traced_model = torch.jit.trace(
                 base_model,
@@ -99,13 +101,11 @@ class OptimizedEmbeddingModel:
             )
             self.model = torch.jit.optimize_for_inference(traced_model)
         
-        # Pre-allocate buffers
         self.input_buffers = {
-            'input_ids': torch.zeros((self.batch_size, 128), dtype=torch.long, device=self.device),
-            'attention_mask': torch.zeros((self.batch_size, 128), dtype=torch.long, device=self.device)
+            'input_ids': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device),
+            'attention_mask': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device)
         }
         
-        # Get output shape and pre-allocate output buffer
         with torch.inference_mode():
             outputs = self.model(inputs['input_ids'], inputs['attention_mask'])
             embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
@@ -115,18 +115,12 @@ class OptimizedEmbeddingModel:
                 device=self.device
             )
         
-        # Cleanup
         del base_model, traced_model, outputs, embeddings
         gc.collect()
         
-        # Warm up
-        self._warm_up()
-        
-    def _warm_up(self):
-        print("Warming up model...")
+        # Warm up silently
         warmup_texts = ["Warm-up sentence"] * 8
         _ = self.encode(warmup_texts)
-        print("Warm-up complete")
         
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output['last_hidden_state']
@@ -138,34 +132,39 @@ class OptimizedEmbeddingModel:
     
     def encode(self, texts: List[str]) -> np.ndarray:
         with torch.inference_mode():
-            # Tokenize
             inputs = self.tokenizer(
                 texts,
                 padding=True,
                 truncation=True,
-                max_length=128,
+                max_length=MAX_SEQ_LENGTH,
                 return_tensors="pt"
             )
             
-            # Use pre-allocated buffers
             for k, v in inputs.items():
                 if k in self.input_buffers:
                     self.input_buffers[k][:v.size(0), :v.size(1)] = v.to(self.device)
                     inputs[k] = self.input_buffers[k][:v.size(0), :v.size(1)]
             
-            # Forward pass
             outputs = self.model(inputs['input_ids'], inputs['attention_mask'])
             embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
             
-            # Use output buffer
             self.output_buffer[:embeddings.size(0)] = embeddings
             return self.output_buffer[:embeddings.size(0)].cpu().numpy()
 
-async def reset_test_casts(pool):
-    """Reset and populate test_casts table with 100k casts."""
-    print("\nResetting test_casts table...")
+async def get_table_estimate(pool, table_name: str) -> int:
+    """Get fast row count estimate using pg_class statistics."""
     async with pool.acquire() as conn:
-        await conn.execute("""
+        result = await conn.fetchval("""
+            SELECT reltuples::bigint AS estimate
+            FROM pg_class
+            WHERE relname = $1
+        """, table_name)
+        return int(result or 0)
+
+async def reset_test_casts(pool):
+    """Reset and populate test_casts table with sample casts."""
+    async with pool.acquire() as conn:
+        await conn.execute(f"""
             TRUNCATE TABLE public.test_casts;
             
             INSERT INTO public.test_casts (id, text)
@@ -174,9 +173,10 @@ async def reset_test_casts(pool):
             WHERE text IS NOT NULL 
             AND length(trim(text)) > 0
             ORDER BY id
-            LIMIT 100000;
+            LIMIT {TEST_SAMPLE_SIZE};
         """)
-    print("Test casts table reset complete.")
+        # Update table statistics
+        await conn.execute("ANALYZE public.test_casts")
 
 async def fetch_test_batch(pool, limit: int = 100) -> List[Dict[str, Any]]:
     """Fetch a batch of test casts."""
@@ -213,22 +213,24 @@ def get_gpu_memory():
     except:
         return 0
 
-def run_benchmark_process(texts: List[str], batch_size: int, queue=None):
+def run_benchmark_process(texts: List[str], batch_size: int, progress_queue=None, metrics_queue=None):
     """Run benchmark in a separate process."""
-    model = OptimizedEmbeddingModel(batch_size)
+    model = OptimizedEmbeddingModel(batch_size, quiet=True)
     
     start_time = time.time()
     pid = os.getpid()
     peak_memory = 0
+    total_batches = len(range(0, len(texts), batch_size))
     
-    # Process texts in batches
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i + batch_size]
         _ = model.encode(batch)
         
-        # Track peak memory (both RAM and GPU)
         current_memory = get_process_memory(pid) + get_gpu_memory()
         peak_memory = max(peak_memory, current_memory)
+        
+        if progress_queue:
+            progress_queue.put(1)  # Report one batch complete
     
     duration = time.time() - start_time
     
@@ -241,29 +243,37 @@ def run_benchmark_process(texts: List[str], batch_size: int, queue=None):
         num_instances=1
     )
     
-    if queue:
-        queue.put(metrics)
+    if metrics_queue:
+        metrics_queue.put(metrics)
     return metrics
 
 async def run_benchmark(pool, batch_size: int, num_instances: int):
     """Run benchmark with specified batch size and number of instances."""
     print(f"\nRunning benchmark with batch_size={batch_size}, instances={num_instances}")
     
-    # Fetch test casts
+    # Fetch test data
     all_casts = await fetch_test_batch(pool, 100000)
     texts = [cast['text'] for cast in all_casts]
+    print(f"Processing {len(texts)} texts...")
     
     if num_instances == 1:
         # Single instance benchmark
-        metrics = run_benchmark_process(texts, batch_size)
-        print(f"Single instance results: {metrics.to_dict()}")
+        total_batches = len(range(0, len(texts), batch_size))
+        with tqdm(total=total_batches, desc="Processing", unit="batch") as pbar:
+            metrics = run_benchmark_process(texts, batch_size)
+            pbar.update(total_batches)
         return metrics
     else:
         # Multi-instance benchmark
         texts_per_instance = len(texts) // num_instances
-        queue = multiprocessing.Queue()
+        progress_queue = multiprocessing.Queue()
+        metrics_queue = multiprocessing.Queue()
         processes = []
         
+        # Calculate total batches across all instances
+        total_batches = sum(len(range(0, texts_per_instance, batch_size)) for _ in range(num_instances))
+        
+        # Start processes
         for i in range(num_instances):
             start_idx = i * texts_per_instance
             end_idx = start_idx + texts_per_instance
@@ -271,75 +281,72 @@ async def run_benchmark(pool, batch_size: int, num_instances: int):
             
             p = multiprocessing.Process(
                 target=run_benchmark_process,
-                args=(instance_texts, batch_size, queue)
+                args=(instance_texts, batch_size, progress_queue, metrics_queue)
             )
             p.start()
             processes.append(p)
         
-        # Wait longer for processes to fully initialize
-        time.sleep(10)  # Increased from 2s to 10s
-        
-        # Measure peak memory across all processes
-        total_peak_memory = 0
-        measurement_attempts = 5
-        
-        # Take multiple measurements to catch peak usage
-        for _ in range(measurement_attempts):
-            current_total = 0
-            for p in processes:
+        # Monitor progress with a single progress bar
+        with tqdm(total=total_batches, desc="Processing", unit="batch") as pbar:
+            completed_batches = 0
+            while completed_batches < total_batches:
                 try:
-                    process_memory = get_process_memory(p.pid) + get_gpu_memory()
-                    current_total += process_memory
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            total_peak_memory = max(total_peak_memory, current_total)
-            time.sleep(2)  # Wait between measurements
+                    progress = progress_queue.get(timeout=1)
+                    completed_batches += progress
+                    pbar.update(progress)
+                except:
+                    # Check if processes are still alive
+                    if not any(p.is_alive() for p in processes):
+                        break
         
-        # Wait for completion
+        # Wait for completion and collect metrics
         for p in processes:
             p.join()
         
-        # Collect performance metrics
         instance_metrics = []
-        while not queue.empty():
-            metrics = queue.get()
+        while not metrics_queue.empty():
+            metrics = metrics_queue.get()
             instance_metrics.append(metrics)
         
         # Aggregate metrics
         total_texts = sum(m.total_texts for m in instance_metrics)
         total_duration = max(m.duration_seconds for m in instance_metrics)
-        avg_memory_per_instance = total_peak_memory / num_instances if num_instances > 0 else 0
+        total_peak_memory = sum(m.memory_usage_mb for m in instance_metrics)
         
         metrics = BenchmarkMetrics(
             texts_per_second=total_texts / total_duration,
-            memory_usage_mb=avg_memory_per_instance,
+            memory_usage_mb=total_peak_memory / num_instances,
             batch_size=batch_size,
             total_texts=total_texts,
             duration_seconds=total_duration,
             num_instances=num_instances
         )
         
-        print(f"Multi-instance results: {metrics.to_dict()}\n")
-        print(f"Total peak memory across all instances: {total_peak_memory:.1f}MB")
+        print(f"\nTotal peak memory: {total_peak_memory:.1f}MB")
         return metrics
 
 async def main():
     """Main benchmark orchestration."""
     try:
-        # Initialize database pool and run migrations
+        start_time = time.time()
+        print("\nStarting benchmark...")
+        
         await db.initialize_pool()
         await db.run_migrations(module_path=str(Path(__file__).parent))
         
         results = []
-        batch_sizes = [256]  # Fixed optimal batch size
-        instance_counts = [1]#, 6, 36]  # Testing key scaling points
+        batch_sizes = [BATCH_SIZE]  # Using configured batch size
+        instance_counts = [NUM_PROCESSES]  # Using configured process count
         
         for batch_size in batch_sizes:
-            # Reset test data
-            await db.reset_test_casts()
+            print("\nPreparing test data...")
+            await reset_test_casts(db.pool)
+            
+            # Get row estimate after population
+            total_rows = await get_table_estimate(db.pool, "test_casts")
+            print(f"Estimated rows in test table: {total_rows:,}")
             
             for num_instances in instance_counts:
-                print(f"\nTesting with {num_instances} instances")
                 metrics = await run_benchmark(db.pool, batch_size, num_instances)
                 results.append({
                     "batch_size": batch_size,
@@ -347,9 +354,7 @@ async def main():
                     **metrics.to_dict()
                 })
                 
-                # Clean up
                 gc.collect()
-                await asyncio.sleep(5)
         
         # Save results
         results_dir = Path(__file__).parent / "results"
@@ -358,7 +363,9 @@ async def main():
         
         with open(result_file, 'w') as f:
             json.dump(results, f, indent=2)
-            
+        
+        total_duration = time.time() - start_time
+        
         print(f"\nBenchmark results saved to {result_file}")
         print("\nResults summary:")
         print("=" * 80)
@@ -369,12 +376,12 @@ async def main():
                   f"TPS: {result['texts_per_second']:.1f}, "
                   f"Memory/Instance: {result['memory_usage_mb']:.1f}MB, "
                   f"Total Memory: {total_memory:.1f}MB")
+        print(f"Total time: {total_duration:.1f}s")
         print("=" * 80)
         
     finally:
         await db.close_pool()
 
 if __name__ == "__main__":
-    # Required for multiprocessing on macOS
     multiprocessing.set_start_method('spawn')
     asyncio.run(main()) 
