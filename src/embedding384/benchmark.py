@@ -1,7 +1,7 @@
 """
 Benchmark embedding generation using cast texts.
 Tests performance across different batch sizes (128, 256, 512, 1024) with both single and multi-instance scaling.
-Uses TorchScript optimization and float16 precision on MPS.
+Uses TorchScript optimization and float16 precision on MPS, with int8 quantization for storage.
 """
 
 # Configuration settings
@@ -20,7 +20,7 @@ import json
 from pathlib import Path
 import subprocess
 import asyncio
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 from dataclasses import dataclass
 import numpy as np
 from dotenv import load_dotenv
@@ -49,6 +49,7 @@ class BenchmarkMetrics:
     total_texts: int
     duration_seconds: float
     num_instances: int
+    avg_cosine_sim: float = 0.0  # Average cosine similarity between float16 and int8
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -57,8 +58,13 @@ class BenchmarkMetrics:
             "batch_size": self.batch_size,
             "total_texts": self.total_texts,
             "duration_seconds": round(self.duration_seconds, 2),
-            "num_instances": self.num_instances
+            "num_instances": self.num_instances,
+            "avg_cosine_sim": round(self.avg_cosine_sim, 6)
         }
+
+def cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+    """Compute cosine similarity between two tensors."""
+    return float(torch.nn.functional.cosine_similarity(a, b, dim=1).mean().item())
 
 class OptimizedEmbeddingModel:
     def __init__(self, batch_size: int, quiet: bool = False):
@@ -130,7 +136,7 @@ class OptimizedEmbeddingModel:
         normalized = sum_embeddings / sum_mask
         return torch.nn.functional.normalize(normalized, p=2, dim=1)
     
-    def encode(self, texts: List[str]) -> np.ndarray:
+    def encode(self, texts: List[str]) -> Tuple[np.ndarray, float]:
         with torch.inference_mode():
             inputs = self.tokenizer(
                 texts,
@@ -149,7 +155,28 @@ class OptimizedEmbeddingModel:
             embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
             
             self.output_buffer[:embeddings.size(0)] = embeddings
-            return self.output_buffer[:embeddings.size(0)].cpu().numpy()
+            float16_embeddings = self.output_buffer[:embeddings.size(0)]
+            
+            # Convert to CPU and float32 for quantization
+            emb_cpu = float16_embeddings.detach().cpu().float()
+            
+            # Global scaling factor based on maximum absolute value across all vectors
+            global_max_abs = emb_cpu.abs().max()
+            global_scale = global_max_abs / 127.0
+            
+            # Quantize to int8 (-128 to 127) using global scale
+            quantized = (emb_cpu / global_scale).round().clamp(-128, 127).to(torch.int8)
+            
+            # For similarity comparison:
+            # 1. Convert original float16 to float32 for comparison
+            orig_float32 = float16_embeddings.cpu().float()
+            # 2. Convert quantized back to same scale as original
+            quantized_float32 = (quantized.float() * global_scale)
+            
+            # Compute cosine similarity between original and quantized
+            sim = cosine_similarity(orig_float32, quantized_float32)
+            
+            return quantized.numpy(), sim
 
 async def get_table_estimate(pool, table_name: str) -> int:
     """Get fast row count estimate using pg_class statistics."""
@@ -184,6 +211,7 @@ async def fetch_test_batch(pool, limit: int = 100) -> List[Dict[str, Any]]:
         rows = await conn.fetch("""
             SELECT id, text 
             FROM public.test_casts 
+            WHERE embedding384 IS NULL
             ORDER BY id
             LIMIT $1
         """, limit)
@@ -213,7 +241,7 @@ def get_gpu_memory():
     except:
         return 0
 
-def run_benchmark_process(texts: List[str], batch_size: int, progress_queue=None, metrics_queue=None):
+def run_benchmark_process(texts: List[str], ids: List[int], batch_size: int, progress_queue=None, metrics_queue=None):
     """Run benchmark in a separate process."""
     model = OptimizedEmbeddingModel(batch_size, quiet=True)
     
@@ -221,31 +249,77 @@ def run_benchmark_process(texts: List[str], batch_size: int, progress_queue=None
     pid = os.getpid()
     peak_memory = 0
     total_batches = len(range(0, len(texts), batch_size))
+    total_sim = 0.0
+    batch_count = 0
     
-    for i in range(0, len(texts), batch_size):
-        batch = texts[i:i + batch_size]
-        _ = model.encode(batch)
+    try:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(db.initialize_pool())
         
-        current_memory = get_process_memory(pid) + get_gpu_memory()
-        peak_memory = max(peak_memory, current_memory)
+        async def process_batches():
+            nonlocal total_sim, batch_count
+            async with db.pool.acquire() as conn:
+                async with conn.transaction():
+                    for i in range(0, len(texts), batch_size):
+                        batch_texts = texts[i:i + batch_size]
+                        batch_ids = ids[i:i + batch_size]
+                        embeddings, sim = model.encode(batch_texts)
+                        total_sim += sim
+                        batch_count += 1
+                        
+                        # Prepare value strings for batch update
+                        value_strings = []
+                        for id_, emb in zip(batch_ids, embeddings):
+                            vec_str = '[' + ','.join(map(str, emb)) + ']'
+                            value_strings.append(f"({id_}, '{vec_str}')")
+                        
+                        values_clause = ','.join(value_strings)
+                        
+                        # Single UPDATE statement for entire batch
+                        update_sql = f"""
+                            UPDATE test_casts AS t
+                            SET embedding384 = v.embedding::vector
+                            FROM (VALUES {values_clause}) AS v(id, embedding)
+                            WHERE t.id = v.id
+                        """
+                        
+                        await conn.execute(update_sql)
+                        
+                        nonlocal peak_memory
+                        current_memory = get_process_memory(pid) + get_gpu_memory()
+                        peak_memory = max(peak_memory, current_memory)
+                        
+                        if progress_queue:
+                            progress_queue.put(1)
         
-        if progress_queue:
-            progress_queue.put(1)  # Report one batch complete
-    
-    duration = time.time() - start_time
-    
-    metrics = BenchmarkMetrics(
-        texts_per_second=len(texts) / duration,
-        memory_usage_mb=peak_memory,
-        batch_size=batch_size,
-        total_texts=len(texts),
-        duration_seconds=duration,
-        num_instances=1
-    )
-    
-    if metrics_queue:
-        metrics_queue.put(metrics)
-    return metrics
+        loop.run_until_complete(process_batches())
+        
+        duration = time.time() - start_time
+        avg_sim = total_sim / batch_count if batch_count > 0 else 0.0
+        
+        metrics = BenchmarkMetrics(
+            texts_per_second=len(texts) / duration,
+            memory_usage_mb=peak_memory,
+            batch_size=batch_size,
+            total_texts=len(texts),
+            duration_seconds=duration,
+            num_instances=1,
+            avg_cosine_sim=avg_sim
+        )
+        
+        if metrics_queue:
+            metrics_queue.put(metrics)
+            
+        # Clean up
+        loop.run_until_complete(db.close_pool())
+        loop.close()
+        
+        return metrics
+        
+    except Exception as e:
+        print(f"Error in benchmark process: {str(e)}")
+        raise
 
 async def run_benchmark(pool, batch_size: int, num_instances: int):
     """Run benchmark with specified batch size and number of instances."""
@@ -254,13 +328,14 @@ async def run_benchmark(pool, batch_size: int, num_instances: int):
     # Fetch test data
     all_casts = await fetch_test_batch(pool, 100000)
     texts = [cast['text'] for cast in all_casts]
+    ids = [cast['id'] for cast in all_casts]
     print(f"Processing {len(texts)} texts...")
     
     if num_instances == 1:
         # Single instance benchmark
         total_batches = len(range(0, len(texts), batch_size))
         with tqdm(total=total_batches, desc="Processing", unit="batch") as pbar:
-            metrics = run_benchmark_process(texts, batch_size)
+            metrics = run_benchmark_process(texts, ids, batch_size)
             pbar.update(total_batches)
         return metrics
     else:
@@ -278,10 +353,11 @@ async def run_benchmark(pool, batch_size: int, num_instances: int):
             start_idx = i * texts_per_instance
             end_idx = start_idx + texts_per_instance
             instance_texts = texts[start_idx:end_idx]
+            instance_ids = ids[start_idx:end_idx]
             
             p = multiprocessing.Process(
                 target=run_benchmark_process,
-                args=(instance_texts, batch_size, progress_queue, metrics_queue)
+                args=(instance_texts, instance_ids, batch_size, progress_queue, metrics_queue)
             )
             p.start()
             processes.append(p)
@@ -312,6 +388,7 @@ async def run_benchmark(pool, batch_size: int, num_instances: int):
         total_texts = sum(m.total_texts for m in instance_metrics)
         total_duration = max(m.duration_seconds for m in instance_metrics)
         total_peak_memory = sum(m.memory_usage_mb for m in instance_metrics)
+        avg_sim = sum(m.avg_cosine_sim for m in instance_metrics) / len(instance_metrics)
         
         metrics = BenchmarkMetrics(
             texts_per_second=total_texts / total_duration,
@@ -319,7 +396,8 @@ async def run_benchmark(pool, batch_size: int, num_instances: int):
             batch_size=batch_size,
             total_texts=total_texts,
             duration_seconds=total_duration,
-            num_instances=num_instances
+            num_instances=num_instances,
+            avg_cosine_sim=avg_sim
         )
         
         print(f"\nTotal peak memory: {total_peak_memory:.1f}MB")
@@ -375,7 +453,8 @@ async def main():
                   f"Instances: {result['num_instances']}, "
                   f"TPS: {result['texts_per_second']:.1f}, "
                   f"Memory/Instance: {result['memory_usage_mb']:.1f}MB, "
-                  f"Total Memory: {total_memory:.1f}MB")
+                  f"Total Memory: {total_memory:.1f}MB, "
+                  f"Avg Cosine Sim: {result['avg_cosine_sim']:.6f}")
         print(f"Total time: {total_duration:.1f}s")
         print("=" * 80)
         
