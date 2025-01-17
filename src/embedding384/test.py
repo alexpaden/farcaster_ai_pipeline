@@ -239,7 +239,10 @@ async def get_unprocessed_estimate(pool, last_id: int = 0) -> int:
                     WHERE embedding384 IS NULL 
                     AND id > $1
                     AND text IS NOT NULL 
-                    AND length(trim(text)) > 0))::bigint AS estimate
+                    AND length(trim(text)) > 0
+                    AND (embedding384_updated_at IS NULL OR 
+                         embedding384_updated_at < NOW() - INTERVAL '10 minutes')
+                    ))::bigint AS estimate
             FROM pg_class 
             WHERE relname = 'casts'
         """, last_id)
@@ -249,17 +252,27 @@ async def fetch_next_batch(pool, last_id: int = 0, limit: int = 100) -> List[Dic
     """Fetch next batch of unprocessed casts."""
     async with pool.acquire() as conn:
         await conn.execute("SET statement_timeout = '30s'")
-        rows = await conn.fetch("""
-            SELECT id, text 
-            FROM public.casts 
-            WHERE embedding384 IS NULL
-            AND id > $1
-            AND text IS NOT NULL 
-            AND length(trim(text)) > 0
-            ORDER BY id
-            LIMIT $2
-        """, last_id, limit)
-        return [dict(row) for row in rows]
+        # Use a transaction to ensure atomicity
+        async with conn.transaction():
+            # First, select and lock the batch of rows we want to process
+            rows = await conn.fetch("""
+                UPDATE public.casts 
+                SET embedding384_updated_at = NOW()
+                WHERE id IN (
+                    SELECT id 
+                    FROM public.casts 
+                    WHERE embedding384 IS NULL
+                    AND id > $1
+                    AND text IS NOT NULL 
+                    AND length(trim(text)) > 0
+                    AND embedding384_updated_at IS NULL
+                    ORDER BY id
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING id, text
+            """, last_id, limit)
+            return [dict(row) for row in rows]
 
 class BatchProcessor:
     def __init__(self, pool, batch_size: int):
