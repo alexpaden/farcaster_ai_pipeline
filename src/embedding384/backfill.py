@@ -26,7 +26,7 @@ from src.db.connect import db
 
 # Configuration
 BATCH_SIZE = 256  # Optimal batch size for MPS
-NUM_PROCESSES = 48  # Number of parallel processes
+NUM_PROCESSES = 12  # Number of parallel processes to match benchmark
 MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
@@ -60,7 +60,8 @@ class OptimizedEmbeddingModel:
         base_model.to(self.device)
         base_model.eval()
         
-        sample_texts = ["This is a longer initialization text that will ensure adequate buffer sizes"] * 32
+        # Initialize with full batch size for optimal performance
+        sample_texts = ["This is a longer initialization text that will ensure adequate buffer sizes"] * self.batch_size
         inputs = self.tokenizer(
             sample_texts,
             padding=True,
@@ -77,25 +78,11 @@ class OptimizedEmbeddingModel:
             )
             self.model = torch.jit.optimize_for_inference(traced_model)
         
-        self.input_buffers = {
-            'input_ids': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device),
-            'attention_mask': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device)
-        }
-        
-        with torch.inference_mode():
-            outputs = self.model(inputs['input_ids'], inputs['attention_mask'])
-            embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
-            self.output_buffer = torch.zeros(
-                (self.batch_size, embeddings.shape[1]),
-                dtype=torch.float16,
-                device=self.device
-            )
-        
-        del base_model, traced_model, outputs, embeddings
+        del base_model, traced_model
         gc.collect()
         
-        # Warm up silently
-        warmup_texts = ["Warm-up sentence"] * 8
+        # Warm up with full batch
+        warmup_texts = ["Warm-up sentence"] * self.batch_size
         _ = self.encode(warmup_texts)
         
     def _mean_pooling(self, model_output, attention_mask):
@@ -114,18 +101,11 @@ class OptimizedEmbeddingModel:
                 truncation=True,
                 max_length=MAX_SEQ_LENGTH,
                 return_tensors="pt"
-            )
-            
-            for k, v in inputs.items():
-                if k in self.input_buffers:
-                    self.input_buffers[k][:v.size(0), :v.size(1)] = v.to(self.device)
-                    inputs[k] = self.input_buffers[k][:v.size(0), :v.size(1)]
+            ).to(self.device)
             
             outputs = self.model(inputs['input_ids'], inputs['attention_mask'])
             embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
-            
-            self.output_buffer[:embeddings.size(0)] = embeddings
-            return self.output_buffer[:embeddings.size(0)].cpu().numpy()
+            return embeddings.cpu().numpy()
 
 async def get_table_stats(pool) -> Tuple[int, int, int]:
     """Get fast row estimate and ID range using pg_class statistics."""
@@ -151,18 +131,15 @@ async def get_table_stats(pool) -> Tuple[int, int, int]:
         
         return int(estimate or 0), min_id, max_id
 
-async def process_batch(conn, ids: List[int]) -> List[Dict[str, Any]]:
-    """Fetch a batch of casts by IDs."""
-    if not ids:
-        return []
-    
+async def process_batch(conn, batch_size: int, max_rows: int = None) -> List[Dict[str, Any]]:
+    """Fetch a batch of casts that need processing."""
     rows = await conn.fetch("""
-        SELECT id, text
-        FROM public.casts
-        WHERE id = ANY($1)
-        AND embedding384 IS NULL
-        ORDER BY id
-    """, ids)
+        SELECT id, text 
+        FROM public.casts 
+        WHERE embedding384 IS NULL
+        LIMIT $1
+        FOR UPDATE SKIP LOCKED
+    """, batch_size)
     
     return [dict(row) for row in rows]
 
@@ -171,47 +148,109 @@ async def update_embeddings(conn, id_embedding_pairs: List[Tuple[int, List[float
     if not id_embedding_pairs:
         return
     
-    await conn.executemany("""
-        UPDATE public.casts
-        SET embedding384 = $2
-        WHERE id = $1
-        AND embedding384 IS NULL
-    """, [(id, embedding.tolist()) for id, embedding in id_embedding_pairs])
+    # Prepare value strings for batch update
+    value_strings = []
+    for id_, emb in id_embedding_pairs:
+        vec_str = '[' + ','.join(map(str, emb.tolist())) + ']'
+        value_strings.append(f"({id_}, '{vec_str}')")
+    
+    values_clause = ','.join(value_strings)
+    
+    # Single UPDATE statement for entire batch
+    update_sql = f"""
+        UPDATE casts AS t
+        SET embedding384 = v.embedding::vector
+        FROM (VALUES {values_clause}) AS v(id, embedding)
+        WHERE t.id = v.id
+    """
+    
+    await conn.execute(update_sql)
 
-async def process_range(start_id: int, end_id: int, batch_size: int, progress_queue=None):
-    """Process a range of IDs in batches."""
+def process_range_sync(worker_id: int, batch_size: int, max_rows: int, progress_queue=None):
+    """Synchronous wrapper for processing batches."""
     model = OptimizedEmbeddingModel(batch_size)
+    processed_count = 0
+    total_fetch_time = 0
+    total_inference_time = 0
+    total_update_time = 0
+    batch_count = 0
+    start_time = time.time()
     
     try:
-        async with db.pool.acquire() as conn:
-            current_id = start_id
-            while current_id <= end_id:
-                # Get next batch of IDs
-                id_batch = list(range(current_id, min(current_id + batch_size, end_id + 1)))
-                
-                # Process batch
-                rows = await process_batch(conn, id_batch)
-                if not rows:
-                    current_id += batch_size
-                    continue
-                
-                # Generate embeddings
-                texts = [row['text'] for row in rows]
-                embeddings = model.encode(texts)
-                
-                # Update database
-                id_embedding_pairs = list(zip([row['id'] for row in rows], embeddings))
-                await update_embeddings(conn, id_embedding_pairs)
-                
-                # Report progress
-                if progress_queue:
-                    progress_queue.put(len(rows))
-                
-                current_id += batch_size
-                
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        async def process_range_async():
+            nonlocal processed_count, total_fetch_time, total_inference_time, total_update_time, batch_count
+            await db.initialize_pool()
+            
+            try:
+                async with db.pool.acquire() as conn:
+                    while processed_count < max_rows:
+                        async with conn.transaction():
+                            # Time DB fetch
+                            fetch_start = time.time()
+                            rows = await process_batch(conn, min(batch_size, max_rows - processed_count))
+                            fetch_time = time.time() - fetch_start
+                            total_fetch_time += fetch_time
+                            
+                            if not rows:
+                                break
+                            
+                            # Time inference
+                            inference_start = time.time()
+                            texts = [row['text'] for row in rows]
+                            embeddings = model.encode(texts)
+                            inference_time = time.time() - inference_start
+                            total_inference_time += inference_time
+                            
+                            # Time DB update
+                            update_start = time.time()
+                            id_embedding_pairs = list(zip([row['id'] for row in rows], embeddings))
+                            await update_embeddings(conn, id_embedding_pairs)
+                            update_time = time.time() - update_start
+                            total_update_time += update_time
+                            
+                            rows_processed = len(rows)
+                            processed_count += rows_processed
+                            batch_count += 1
+                            
+                            # Log timing details every 10 batches
+                            if batch_count % 10 == 0:
+                                elapsed = time.time() - start_time
+                                print(f"\nWorker {worker_id} stats after {batch_count} batches:")
+                                print(f"Avg fetch time: {(total_fetch_time/batch_count)*1000:.1f}ms")
+                                print(f"Avg inference time: {(total_inference_time/batch_count)*1000:.1f}ms")
+                                print(f"Avg update time: {(total_update_time/batch_count)*1000:.1f}ms")
+                                print(f"Overall TPS: {processed_count/elapsed:.1f}")
+                            
+                            if progress_queue:
+                                progress_queue.put(rows_processed)
+                            
+                            # Force garbage collection periodically
+                            if processed_count % (batch_size * 100) == 0:
+                                gc.collect()
+                        
+            finally:
+                await db.close_pool()
+        
+        loop.run_until_complete(process_range_async())
+        loop.close()
+        
     except Exception as e:
-        print(f"Error processing range {start_id}-{end_id}: {str(e)}")
+        print(f"Error in worker {worker_id}: {str(e)}")
         raise
+    
+    # Final timing summary
+    elapsed = time.time() - start_time
+    print(f"\nWorker {worker_id} final stats:")
+    print(f"Total batches: {batch_count}")
+    print(f"Avg fetch time: {(total_fetch_time/batch_count)*1000:.1f}ms")
+    print(f"Avg inference time: {(total_inference_time/batch_count)*1000:.1f}ms")
+    print(f"Avg update time: {(total_update_time/batch_count)*1000:.1f}ms")
+    print(f"Overall TPS: {processed_count/elapsed:.1f}")
+    
+    return processed_count
 
 async def main():
     """Main backfill orchestration."""
@@ -224,34 +263,27 @@ async def main():
         await db.run_migrations(module_path=str(Path(__file__).parent))
         
         # Get table statistics
-        total_rows, min_id, max_id = await get_table_stats(db.pool)
-        if max_id == 0:
-            print("No rows to process")
-            return
-        
+        total_rows = 100_000  # Fixed number of rows for benchmarking
         print(f"\nProcessing casts table:")
-        print(f"Estimated total rows: {total_rows:,}")
-        print(f"Processing ID range: {min_id:,} - {max_id:,}")
-        
-        # Calculate ranges for each process
-        id_range = max_id - min_id + 1
-        chunk_size = id_range // NUM_PROCESSES
-        ranges = [
-            (min_id + i * chunk_size, min_id + (i + 1) * chunk_size - 1)
-            for i in range(NUM_PROCESSES)
-        ]
-        ranges[-1] = (ranges[-1][0], max_id)  # Ensure last range includes max_id
+        print(f"Target rows: {total_rows:,}")
         
         # Set up progress tracking
         progress_queue = multiprocessing.Queue()
         processes = []
         
+        # Calculate rows per worker
+        rows_per_worker = total_rows // NUM_PROCESSES
+        
         # Start worker processes
         print(f"\nStarting {NUM_PROCESSES} worker processes...")
-        for start, end in ranges:
+        for worker_id in range(NUM_PROCESSES):
+            worker_rows = rows_per_worker
+            if worker_id == NUM_PROCESSES - 1:  # Last worker gets any remainder
+                worker_rows = total_rows - (NUM_PROCESSES - 1) * rows_per_worker
+                
             p = multiprocessing.Process(
-                target=asyncio.run,
-                args=(process_range(start, end, BATCH_SIZE, progress_queue),)
+                target=process_range_sync,
+                args=(worker_id, BATCH_SIZE, worker_rows, progress_queue)
             )
             p.start()
             processes.append(p)
