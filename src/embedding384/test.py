@@ -6,8 +6,8 @@ Stores embeddings as int8 vectors for efficiency.
 
 # Configuration settings
 BATCH_SIZE = 256  # Optimal batch size for MPS
-NUM_PROCESSES = 32  # Number of parallel processes
-PREFETCH_BATCHES = 3  # Number of batches to prefetch
+NUM_PROCESSES = 18  # Number of parallel processes
+PREFETCH_BATCHES = 2  # Number of batches to prefetch
 BATCH_SIZE_ROWS = 100000  # Number of rows to process per instance
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization (model max is 256)
@@ -168,17 +168,6 @@ class BenchmarkMetrics:
     duration_seconds: float
     num_instances: int
     avg_cosine_sim: float = 0.0  # Average cosine similarity between float16 and int8
-    
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "texts_per_second": round(self.texts_per_second, 2),
-            "memory_usage_mb": round(self.memory_usage_mb, 2),
-            "batch_size": self.batch_size,
-            "total_texts": self.total_texts,
-            "duration_seconds": round(self.duration_seconds, 2),
-            "num_instances": self.num_instances,
-            "avg_cosine_sim": round(self.avg_cosine_sim, 6)
-        }
 
 @dataclass
 class ProcessingStats:
@@ -214,45 +203,6 @@ class ProcessingStats:
             
             self.last_log_time = current_time
             self.last_processed = self.total_processed
-
-async def get_table_estimate(pool, table_name: str) -> int:
-    """Get fast row count estimate using pg_class statistics."""
-    async with pool.acquire() as conn:
-        result = await conn.fetchval("""
-            SELECT reltuples::bigint AS estimate
-            FROM pg_class
-            WHERE relname = $1
-        """, table_name)
-        return int(result or 0)
-
-async def reset_test_casts(pool):
-    """Reset and populate test_casts table with sample casts."""
-    async with pool.acquire() as conn:
-        await conn.execute(f"""
-            TRUNCATE TABLE public.test_casts;
-            
-            INSERT INTO public.test_casts (id, text)
-            SELECT id, text
-            FROM public.casts
-            WHERE text IS NOT NULL 
-            AND length(trim(text)) > 0
-            ORDER BY id
-            LIMIT {TEST_SAMPLE_SIZE};
-        """)
-        # Update table statistics
-        await conn.execute("ANALYZE public.test_casts")
-
-async def fetch_test_batch(pool, limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch a batch of test casts."""
-    async with pool.acquire() as conn:
-        rows = await conn.fetch("""
-            SELECT id, text 
-            FROM public.test_casts 
-            WHERE embedding384 IS NULL
-            ORDER BY id
-            LIMIT $1
-        """, limit)
-        return [dict(row) for row in rows]
 
 def get_process_memory(pid):
     """Get memory usage for a process and all its children."""
