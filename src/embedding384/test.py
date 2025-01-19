@@ -6,12 +6,12 @@ Stores embeddings as int8 vectors for efficiency.
 
 # Configuration settings
 BATCH_SIZE = 256  # Optimal batch size for MPS
-NUM_PROCESSES = 18  # Number of parallel processes
+NUM_PROCESSES = 1  # Number of parallel processes
 PREFETCH_BATCHES = 3  # Increased from 3 to keep pipeline fuller
 BATCH_SIZE_ROWS = 100000  # Number of rows to process per instance
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization (model max is 256)
-DB_TIMEOUT = 30  # Database timeout in seconds
+DB_TIMEOUT = 60  # Database timeout in seconds
 
 import os
 import warnings
@@ -245,89 +245,23 @@ def get_gpu_memory():
         return 0
 
 async def get_unprocessed_estimate(pool, last_id: int = 0) -> int:
-    """Get current count of unprocessed rows."""
+    """Get current count of unprocessed rows using optimized function."""
     async with pool.acquire() as conn:
-        await conn.execute("SET statement_timeout = '30s'")
-        result = await conn.fetchval("""
-            SELECT count(*)
-            FROM public.casts
-            WHERE embedding384 IS NULL 
-            AND id > $1
-            AND text IS NOT NULL 
-            AND length(trim(text)) > 0
-        """, last_id)
+        await conn.execute("SET statement_timeout = '60s'")
+        if last_id == 0:
+            # Use optimized count function for full table count
+            result = await conn.fetchval("SELECT get_unprocessed_count()")
+        else:
+            # For partial counts, use regular query since we need id filter
+            result = await conn.fetchval("""
+                SELECT count(*)
+                FROM public.casts
+                WHERE embedding384 IS NULL 
+                AND id > $1
+                AND text IS NOT NULL 
+                AND length(trim(text)) > 0
+            """, last_id)
         return int(result or 0)
-
-async def fetch_next_batch(pool, last_id: int = 0, limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch next batch of unprocessed casts."""
-    async with pool.acquire() as conn:
-        await conn.execute("SET statement_timeout = '30s'")
-        
-        # Try to get fresh work first
-        async with conn.transaction():
-            rows = await conn.fetch("""
-                WITH batch AS (
-                    SELECT id, text
-                    FROM public.casts 
-                    WHERE embedding384 IS NULL
-                    AND embedding384_updated_at IS NULL
-                    AND id > $1
-                    AND text IS NOT NULL 
-                    AND length(trim(text)) > 0
-                    ORDER BY id
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE public.casts c
-                SET embedding384_updated_at = NOW()
-                FROM batch b
-                WHERE c.id = b.id
-                RETURNING c.id, c.text
-            """, last_id, limit)
-            
-            if rows:
-                return [dict(row) for row in rows]
-        
-        # If no fresh work, look for stale work
-        async with conn.transaction():
-            rows = await conn.fetch("""
-                WITH batch AS (
-                    SELECT id, text
-                    FROM public.casts 
-                    WHERE embedding384 IS NULL
-                    AND embedding384_updated_at < NOW() - INTERVAL '5 minutes'
-                    AND id > $1
-                    AND text IS NOT NULL 
-                    AND length(trim(text)) > 0
-                    ORDER BY id
-                    LIMIT $2
-                    FOR UPDATE SKIP LOCKED
-                )
-                UPDATE public.casts c
-                SET embedding384_updated_at = NOW()
-                FROM batch b
-                WHERE c.id = b.id
-                RETURNING c.id, c.text
-            """, last_id, limit)
-            
-            if rows:
-                print(f"\nFound {len(rows)} stale rows to reprocess")
-                return [dict(row) for row in rows]
-        
-        # If still no work, check if any work remains
-        total_remaining = await conn.fetchval("""
-            SELECT COUNT(*) 
-            FROM public.casts
-            WHERE embedding384 IS NULL
-            AND text IS NOT NULL 
-            AND length(trim(text)) > 0
-            AND id > $1
-        """, last_id)
-        
-        if total_remaining > 0:
-            print(f"\nNo work available now but {total_remaining:,} rows remain (waiting for in-progress work)")
-            
-        return []
 
 @dataclass
 class ProcessingMetrics:
@@ -336,12 +270,21 @@ class ProcessingMetrics:
     db_update_times: List[float] = field(default_factory=list)
     batch_sizes: List[int] = field(default_factory=list)
     memory_usage: List[float] = field(default_factory=list)
+    fetch_times: List[float] = field(default_factory=list)
+    quantize_times: List[float] = field(default_factory=list)
+    upsert_times: List[float] = field(default_factory=list)
     
     def add_timing(self, category: str, duration: float):
         if category == 'model_inference':
             self.model_inference_times.append(duration)
         elif category == 'db_update':
             self.db_update_times.append(duration)
+        elif category == 'fetch':
+            self.fetch_times.append(duration)
+        elif category == 'quantize':
+            self.quantize_times.append(duration)
+        elif category == 'upsert':
+            self.upsert_times.append(duration)
     
     def add_batch_size(self, size: int):
         self.batch_sizes.append(size)
@@ -351,13 +294,15 @@ class ProcessingMetrics:
     
     def log_stats(self):
         """Log current statistics."""
-        if len(self.model_inference_times) % 50 == 0:  # Reduced frequency
+        if len(self.model_inference_times) % 10 == 0:  # Increased frequency
             def safe_avg(lst): return sum(lst[-100:]) / len(lst[-100:]) if lst else 0
             def safe_p95(lst): return sorted(lst[-100:])[int(len(lst[-100:])*0.95)] if len(lst) >= 100 else 0
             
-            print("\nProcess Performance:")
+            print("\nPipeline Performance:")
+            print(f"Fetch Time: avg={safe_avg(self.fetch_times):.3f}s, p95={safe_p95(self.fetch_times):.3f}s")
             print(f"Model Inference: avg={safe_avg(self.model_inference_times):.3f}s, p95={safe_p95(self.model_inference_times):.3f}s")
-            print(f"Database Update: avg={safe_avg(self.db_update_times):.3f}s, p95={safe_p95(self.db_update_times):.3f}s")
+            print(f"Quantization: avg={safe_avg(self.quantize_times):.3f}s, p95={safe_p95(self.quantize_times):.3f}s")
+            print(f"DB Upsert: avg={safe_avg(self.upsert_times):.3f}s, p95={safe_p95(self.upsert_times):.3f}s")
             print(f"Memory Usage (MB): current={self.memory_usage[-1]:.1f}")
 
 class BatchProcessor:
@@ -382,7 +327,7 @@ class BatchProcessor:
                 current_size = self.prefetch_queue.qsize()
                 
                 if current_size < PREFETCH_BATCHES:
-                    batch = await fetch_next_batch(self.pool, self.last_id, self.batch_size)
+                    batch, fetch_time = await fetch_next_batch(self.pool, self.last_id, self.batch_size)
                     
                     if not batch:
                         empty_count += 1
@@ -399,7 +344,7 @@ class BatchProcessor:
                     
                     empty_count = 0
                     self.last_id = batch[-1]['id']
-                    await self.prefetch_queue.put(batch)
+                    await self.prefetch_queue.put((batch, fetch_time))
                     
                     if current_size == 0:
                         print(f"Prefetch: Refilled empty queue with {len(batch)} rows")
@@ -411,7 +356,7 @@ class BatchProcessor:
             self.done = True
             raise
 
-    async def get_next_batch(self) -> Optional[List[Dict[str, Any]]]:
+    async def get_next_batch(self) -> Optional[Tuple[List[Dict[str, Any]], float]]:
         """Get next batch from prefetch queue."""
         if self.done and self.prefetch_queue.empty():
             return None
@@ -420,72 +365,94 @@ class BatchProcessor:
         except asyncio.QueueEmpty:
             return None
 
+async def fetch_next_batch(pool, last_id: int = 0, limit: int = 100) -> Tuple[List[Dict[str, Any]], float]:
+    """Fetch next batch of unprocessed casts."""
+    fetch_start = time.time()
+    async with pool.acquire() as conn:
+        await conn.execute("SET statement_timeout = '60s'")
+        
+        # Simplified query to reduce lock contention
+        rows = await conn.fetch("""
+            SELECT id, text
+            FROM public.casts 
+            WHERE embedding384 IS NULL
+            AND id > $1
+            AND text IS NOT NULL 
+            AND length(trim(text)) > 0
+            ORDER BY id
+            LIMIT $2
+        """, last_id, limit)
+        
+        if not rows:
+            return [], time.time() - fetch_start
+            
+        # Mark rows as in progress
+        ids = [row['id'] for row in rows]
+        await conn.execute("""
+            UPDATE public.casts
+            SET embedding384_updated_at = NOW()
+            WHERE id = ANY($1::bigint[])
+        """, ids)
+        
+        fetch_time = time.time() - fetch_start
+        return [dict(row) for row in rows], fetch_time
+
+class EmbeddingProcessor:
+    """Handles model initialization and inference."""
+    def __init__(self, batch_size: int, quiet: bool = True):
+        self.model = OptimizedEmbeddingModel(batch_size, quiet=quiet)
+        self.batch_size = batch_size
+    
+    def process_batch(self, texts: List[str], ids: List[int]) -> Tuple[np.ndarray, List[int], float]:
+        """Process a batch of texts."""
+        all_embeddings = []
+        all_batch_ids = []
+        all_sims = []
+        
+        for i in range(0, len(texts), self.batch_size):
+            batch_texts = texts[i:i + self.batch_size]
+            batch_ids = ids[i:i + self.batch_size]
+            
+            embeddings, sim = self.model.encode(batch_texts)
+            all_embeddings.append(embeddings)
+            all_batch_ids.extend(batch_ids)
+            all_sims.append(sim)
+        
+        # Combine all batches
+        combined_embeddings = np.vstack(all_embeddings)
+        avg_sim = sum(all_sims) / len(all_sims) if all_sims else 0
+        
+        return combined_embeddings, all_batch_ids, avg_sim
+
 def run_processor_instance(texts: List[str], ids: List[int], batch_size: int, progress_queue=None, metrics_queue=None):
     """Run processing in a separate process."""
-    model = OptimizedEmbeddingModel(batch_size, quiet=True)
     metrics = ProcessingMetrics()
-    
     start_time = time.time()
     pid = os.getpid()
     
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(db.initialize_pool())
+        # Initialize model once
+        processor = EmbeddingProcessor(batch_size, quiet=True)
         
-        async def process_batches():
-            async with db.pool.acquire() as conn:
-                await conn.execute("SET statement_timeout = '30s'")
-                async with conn.transaction():
-                    for i in range(0, len(texts), batch_size):
-                        batch_start = time.time()
-                        batch_texts = texts[i:i + batch_size]
-                        batch_ids = ids[i:i + batch_size]
-                        
-                        # Track memory before inference
-                        cpu_mem = get_process_memory(pid)
-                        gpu_mem = get_gpu_memory()
-                        metrics.add_memory(cpu_mem, gpu_mem)
-                        
-                        # Time model inference
-                        inference_start = time.time()
-                        embeddings, sim = model.encode(batch_texts)
-                        metrics.add_timing('model_inference', time.time() - inference_start)
-                        
-                        # Prepare and execute batch update
-                        update_start = time.time()
-                        value_strings = []
-                        for id_, emb in zip(batch_ids, embeddings):
-                            vec_str = '[' + ','.join(map(str, emb)) + ']'
-                            value_strings.append(f"({id_}, '{vec_str}')")
-                        
-                        values_clause = ','.join(value_strings)
-                        update_sql = f"""
-                            UPDATE casts AS t
-                            SET embedding384 = v.embedding::vector
-                            FROM (VALUES {values_clause}) AS v(id, embedding)
-                            WHERE t.id = v.id
-                        """
-                        
-                        await conn.execute(update_sql)
-                        metrics.add_timing('db_update', time.time() - update_start)
-                        metrics.add_batch_size(len(batch_texts))
-                        
-                        if progress_queue:
-                            progress_queue.put(1)
-                            
-                        # Log metrics every 10 batches
-                        if i % (batch_size * 10) == 0:
-                            metrics.log_stats()
+        # Track memory before inference
+        cpu_mem = get_process_memory(pid)
+        gpu_mem = get_gpu_memory()
+        metrics.add_memory(cpu_mem, gpu_mem)
         
-        loop.run_until_complete(process_batches())
+        # Time model inference
+        inference_start = time.time()
+        embeddings, batch_ids, sim = processor.process_batch(texts, ids)
+        metrics.add_timing('model_inference', time.time() - inference_start)
+        
+        # Signal progress
+        if progress_queue:
+            progress_queue.put(len(texts))
         
         if metrics_queue:
             metrics_queue.put(metrics)
-            
-        loop.run_until_complete(db.close_pool())
-        loop.close()
         
+        return embeddings, batch_ids, sim
+            
     except Exception as e:
         print(f"Error in processor instance: {str(e)}")
         raise
@@ -545,6 +512,7 @@ async def process_casts(pool, batch_size: int, num_instances: int):
     print(f"\nProcessing casts with batch_size={batch_size}, instances={num_instances}")
     
     stats = ProcessingStats()
+    metrics = ProcessingMetrics()
     stats.total_remaining = await get_unprocessed_estimate(pool)
     print(f"Starting processing of {stats.total_remaining:,} rows...")
     
@@ -552,28 +520,52 @@ async def process_casts(pool, batch_size: int, num_instances: int):
     process_manager = ProcessManager(num_instances)
     await processor.start()
     
+    # Initialize model in main process
+    embedding_processor = EmbeddingProcessor(batch_size, quiet=True) if num_instances == 1 else None
+    last_batch_end = time.time()  # Track time between batches
+    
     async def health_monitor():
         while not processor.done:
             stale_pids = await process_manager.check_health()
             if stale_pids:
                 print("\nRestarting stale processes...")
-                # Steal work from stale processes
-                for pid in stale_pids:
-                    async with pool.acquire() as conn:
-                        await conn.execute("""
-                            UPDATE casts
-                            SET embedding384_updated_at = NULL
-                            WHERE embedding384 IS NULL 
-                            AND embedding384_updated_at IS NOT NULL
-                            AND embedding384_updated_at < NOW() - INTERVAL '1 minute'
-                        """)
-            await asyncio.sleep(30)  # Check every 30 seconds
+                async with pool.acquire() as conn:
+                    await conn.execute("""
+                        UPDATE casts
+                        SET embedding384_updated_at = NULL
+                        WHERE embedding384 IS NULL 
+                        AND embedding384_updated_at IS NOT NULL
+                        AND embedding384_updated_at < NOW() - INTERVAL '5 minutes'
+                    """)
+            
+            async with pool.acquire() as conn:
+                await conn.execute("SET statement_timeout = '60s'")
+                verify_count = await conn.fetchval("""
+                    SELECT count(*) 
+                    FROM public.casts 
+                    WHERE embedding384 IS NOT NULL 
+                    AND text IS NOT NULL 
+                    AND length(trim(text)) > 0
+                """)
+                unprocessed_count = await conn.fetchval("SELECT get_unprocessed_count()")
+                print(f"\nVerification - Processed rows in DB: {verify_count:,}")
+                print(f"Verification - Unprocessed rows in DB: {unprocessed_count:,}")
+            
+            await asyncio.sleep(30)
     
     health_task = asyncio.create_task(health_monitor())
     
     try:
         while True:
-            batch = await processor.get_next_batch()
+            batch_start = time.time()
+            gap_time = batch_start - last_batch_end
+            if gap_time > 1.0:  # Log gaps longer than 1 second
+                print(f"\nGap between batches: {gap_time:.1f}s")
+            
+            fetch_start = time.time()
+            batch, fetch_time = await processor.get_next_batch()
+            metrics.add_timing('fetch', time.time() - fetch_start)
+            
             if not batch:
                 remaining = await get_unprocessed_estimate(pool, processor.last_id)
                 if remaining == 0:
@@ -586,9 +578,67 @@ async def process_casts(pool, batch_size: int, num_instances: int):
             ids = [cast['id'] for cast in batch]
             
             if num_instances == 1:
-                metrics = run_processor_instance(texts, ids, batch_size)
-                stats.update(len(texts))
+                # Process in current process using reused model
+                inference_start = time.time()
+                embeddings, batch_ids, sim = embedding_processor.process_batch(texts, ids)
+                inference_time = time.time() - inference_start
+                metrics.add_timing('model_inference', inference_time)
+                
+                # Update database with embeddings in larger chunks
+                chunk_size = 5000
+                for i in range(0, len(batch_ids), chunk_size):
+                    chunk_start = time.time()
+                    chunk_ids = batch_ids[i:i + chunk_size]
+                    chunk_embeddings = embeddings[i:i + chunk_size]
+                    
+                    upsert_start = time.time()
+                    async with pool.acquire() as conn:
+                        async with conn.transaction():
+                            value_strings = [
+                                f"({id_}, '[{','.join(map(str, emb))}]')"
+                                for id_, emb in zip(chunk_ids, chunk_embeddings)
+                            ]
+                            
+                            values_clause = ','.join(value_strings)
+                            update_sql = f"""
+                                UPDATE casts AS t
+                                SET 
+                                    embedding384 = v.embedding::vector,
+                                    embedding384_updated_at = NOW()
+                                FROM (VALUES {values_clause}) AS v(id, embedding)
+                                WHERE t.id = v.id
+                            """
+                            result = await conn.execute(update_sql)
+                            
+                            if hasattr(result, 'split'):
+                                updated = int(result.split()[-1])
+                                if updated != len(chunk_ids):
+                                    print(f"\nWarning: Expected to update {len(chunk_ids)} rows but updated {updated}")
+                    
+                    upsert_time = time.time() - upsert_start
+                    metrics.add_timing('upsert', upsert_time)
+                    stats.update(len(chunk_ids))
+                    
+                    # Get current memory usage
+                    cpu_mem = get_process_memory(os.getpid())
+                    gpu_mem = get_gpu_memory()
+                    metrics.add_memory(cpu_mem, gpu_mem)
+                    
+                    chunk_time = time.time() - chunk_start
+                    
+                    # Log performance metrics with each chunk
+                    print("\nPipeline Performance:")
+                    print(f"Fetch Time: avg={sum(metrics.fetch_times[-100:])/len(metrics.fetch_times[-100:]):.3f}s")
+                    print(f"Model Inference: avg={sum(metrics.model_inference_times[-100:])/len(metrics.model_inference_times[-100:]):.3f}s")
+                    print(f"DB Upsert: avg={sum(metrics.upsert_times[-100:])/len(metrics.upsert_times[-100:]):.3f}s")
+                    print(f"Memory Usage (MB): CPU={cpu_mem:.1f}, GPU={gpu_mem:.1f}")
+                    print(f"Chunk Processing Time: {chunk_time:.3f}s")
+                
+                last_batch_end = time.time()
+                batch_time = last_batch_end - batch_start
+                print(f"Total Batch Time: {batch_time:.3f}s")
             else:
+                # Multi-process handling remains the same
                 texts_per_instance = len(texts) // num_instances
                 progress_queue = multiprocessing.Queue()
                 metrics_queue = multiprocessing.Queue()

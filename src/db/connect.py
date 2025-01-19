@@ -143,8 +143,8 @@ class DatabaseConnection:
                     password=self.db_params['password'],
                     host=self.db_params['host'],
                     port=self.db_params['port'],
-                    min_size=2,  # Minimum connections per process
-                    max_size=4,  # Maximum connections per process
+                    min_size=4,  # Minimum connections per process
+                    max_size=8,  # Maximum connections per process
                     command_timeout=60,
                     server_settings={
                         'application_name': f'farcaster_ai_pipeline_{os.getpid()}'
