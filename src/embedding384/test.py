@@ -5,7 +5,7 @@ Stores embeddings as int8 vectors for efficiency.
 """
 
 # Configuration settings
-BATCH_SIZE = 2048  # Embedding batch size
+BATCH_SIZE = 256  # Embedding batch size
 BATCH_SIZE_ROWS = 50000  # Number of rows to process per instance
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization
