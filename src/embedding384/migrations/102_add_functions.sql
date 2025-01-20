@@ -1,14 +1,3 @@
--- Create a more efficient covering index specifically for count queries
--- Using (1) constant reduces index size since we only need existence info
-CREATE INDEX IF NOT EXISTS idx_casts_embedding_count_v2 
-ON public.casts ((1))
-WHERE embedding384 IS NULL 
-AND text IS NOT NULL 
-AND length(trim(text)) > 0;
-
--- Update statistics to help query planner
-ANALYZE public.casts;
-
 -- Create function to encapsulate optimized count query
 CREATE OR REPLACE FUNCTION get_unprocessed_count()
 RETURNS bigint AS $$
@@ -28,6 +17,7 @@ BEGIN
             WHERE embedding384 IS NULL 
             AND text IS NOT NULL 
             AND length(trim(text)) > 0
+            FOR UPDATE SKIP LOCKED
         ) sub
     );
 END;
