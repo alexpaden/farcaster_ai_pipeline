@@ -6,11 +6,10 @@ Stores embeddings as int8 vectors for efficiency.
 
 # Configuration settings
 BATCH_SIZE = 256  # Embedding batch size
-BATCH_SIZE_ROWS = 50000  # Number of rows to process per instance
+BATCH_SIZE_ROWS = 200000  # Number of rows to process per instance
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 MAX_SEQ_LENGTH = 256  # Maximum sequence length for tokenization
-DB_TIMEOUT = 60  # Database timeout in seconds
-CHUNK_SIZE = 15000  # Rows to update in one transaction chunk
+CHUNK_SIZE = 20000  # Rows to update in one transaction chunk
 
 import os
 import warnings
@@ -797,7 +796,7 @@ async def reset_stale_rows(pool) -> int:
                 SET embedding384_updated_at = NULL
                 WHERE embedding384 IS NULL 
                     AND embedding384_updated_at IS NOT NULL 
-                    AND embedding384_updated_at < NOW() - interval '15 minutes'
+                    AND embedding384_updated_at < NOW() - interval '5 minutes'
                 RETURNING id
             """)
             return len(result)
