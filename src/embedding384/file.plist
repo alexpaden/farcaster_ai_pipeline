@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.farcaster.backfill.embedding384</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/shoni/Desktop/farcaster_ai_pipeline/venv/bin/python</string>
+        <string>-m</string>
+        <string>src.embedding384.backfill</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Users/shoni/Desktop/farcaster_ai_pipeline/venv/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>PYTHONPATH</key>
+        <string>/Users/shoni/Desktop/farcaster_ai_pipeline</string>
+    </dict>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/shoni/Desktop/farcaster_ai_pipeline</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/shoni/Desktop/farcaster_ai_pipeline/logs/backfill.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/shoni/Desktop/farcaster_ai_pipeline/logs/backfill.error.log</string>
+
+    <key>StandardOutPathRotate</key>
+    <true/>
+    <key>StandardErrorPathRotate</key>
+    <true/>
+    <key>StandardOutPathRotateEverySeconds</key>
+    <integer>259200</integer>
+    <key>StandardErrorPathRotateEverySeconds</key>
+    <integer>259200</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>300</integer>
+</dict>
+</plist> 

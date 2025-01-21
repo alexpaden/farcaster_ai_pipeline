@@ -1,9 +1,11 @@
 # Core dependencies
-torch==2.1.2  # MPS support
-transformers==4.36.2
-sentence-transformers==2.2.2
+--find-links https://download.pytorch.org/whl/torch_stable.html
+torch>=2.2.0
+transformers>=4.37.2
+sentence-transformers>=2.3.1
 numpy==1.26.3
 psutil==5.9.7
+accelerate>=0.27.0
 
 # API and services
 fastapi==0.108.0

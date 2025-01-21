@@ -33,6 +33,8 @@ from src.db.connect import db
 # Load environment variables
 load_dotenv()
 
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 @dataclass
 class InferenceMetrics:
     """Track detailed inference metrics."""
@@ -48,7 +50,11 @@ class InferenceMetrics:
 # Configure warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 warnings.filterwarnings("ignore", message=".*_is_quantized_training_enabled.*")
-warnings.filterwarnings("ignore", message=".*loss_type=None.*")
+warnings.filterwarnings(
+    "ignore", 
+    message=r".*loss_type=None.*Unrecognised.*",  # partial text from the warning
+    category=UserWarning
+)
 
 def quantize_worker(queue, shared_dict, shared_event):
     """Worker process for quantizing embeddings."""
@@ -83,23 +89,25 @@ class OptimizedEmbeddingModel:
         
     def _initialize_model(self):
         print("\nInitializing model...")
+        init_start = time.time()
         torch.set_num_threads(multiprocessing.cpu_count())
         gc.collect()
         
-        print("Loading tokenizer...")
+        # Loading tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
         
-        print("Loading base model...")
+        # Loading base model
         base_model = AutoModel.from_pretrained(
             self.model_name,
             torch_dtype=torch.float16,
             low_cpu_mem_usage=True
         )
-        print("Moving model to MPS...")
+        
+        # Moving model to MPS
         base_model.to(self.device)
         base_model.eval()
         
-        print("Preparing sample inputs...")
+        # Preparing sample inputs
         sample_texts = ["This is a longer initialization text that will ensure adequate buffer sizes"] * 32
         inputs = self.tokenizer(
             sample_texts,
@@ -109,23 +117,22 @@ class OptimizedEmbeddingModel:
             return_tensors="pt"
         ).to(self.device)
         
-        print("Tracing model...")
+        # Tracing and optimizing model
         with torch.inference_mode():
             traced_model = torch.jit.trace(
                 base_model,
                 (inputs['input_ids'], inputs['attention_mask']),
                 strict=False
             )
-            print("Optimizing traced model...")
             self.model = torch.jit.optimize_for_inference(traced_model)
         
-        print("Initializing buffers...")
+        # Initialize buffers
         self.input_buffers = {
             'input_ids': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device),
             'attention_mask': torch.zeros((self.batch_size, MAX_SEQ_LENGTH), dtype=torch.long, device=self.device)
         }
         
-        print("Running warmup inference...")
+        # Warmup inference
         with torch.inference_mode():
             outputs = self.model(inputs['input_ids'], inputs['attention_mask'])
             embeddings = self._mean_pooling(outputs, inputs['attention_mask'])
@@ -135,15 +142,15 @@ class OptimizedEmbeddingModel:
                 device=self.device
             )
         
-        print("Cleaning up...")
+        # Cleanup
         del base_model, traced_model, outputs, embeddings
         gc.collect()
         
-        print("Running warmup encode...")
+        # Warmup encode
         warmup_texts = ["Warm-up sentence"] * 8
         _ = self.encode(warmup_texts)
         
-        print("Model initialization complete!")
+        print(f"✨ Model initialization completed in {time.time() - init_start:.1f}s")
         
     def _mean_pooling(self, model_output, attention_mask):
         token_embeddings = model_output['last_hidden_state']
@@ -606,6 +613,10 @@ async def process_casts(pool, batch_size: int):
     stats.total_remaining = await get_unprocessed_estimate(pool)
     print(f"Starting processing of {stats.total_remaining:,} rows...")
     
+    if stats.total_remaining == 0:
+        print("\n✨ No rows to process!")
+        return
+    
     # Initialize processor and queues
     processor = BatchProcessor(pool, BATCH_SIZE_ROWS)
     await processor.start()
@@ -627,11 +638,17 @@ async def process_casts(pool, batch_size: int):
             # Get batch with timing
             op_timing.fetch_start = time.time() - op_timing.operation_start
             fetch_start = time.time()
-            batch, fetch_time = await processor.get_next_batch()
+            result = await processor.get_next_batch()
+            if result is None:
+                print("\n✨ Processing completed successfully - no more rows to process!")
+                break
+                
+            batch, fetch_time = result
             batch_summary.fetch_time = time.time() - fetch_start
             op_timing.fetch_end = time.time() - op_timing.operation_start
             
             if not batch:
+                print("\n✨ Processing completed successfully - no more rows to process!")
                 break
             
             batch_summary.batch_size = len(batch)
@@ -739,6 +756,10 @@ class BatchStats:
     
     def log_quartile(self, current_batch: int, total_batches: int, processed: int, total: int):
         """Log statistics at quartile boundaries."""
+        # Skip logging if there are no batches or we're done processing
+        if total_batches <= 0:
+            return
+            
         if current_batch % (total_batches // 4) == 0:
             metrics = self.inference_metrics[-10:]  # Last 10 sub-batches
             current_time = time.strftime('%Y-%m-%d %H:%M:%S')
@@ -821,6 +842,11 @@ async def main():
         await process_casts(db.pool, BATCH_SIZE)
         
         total_duration = time.time() - start_time
+        if total_unprocessed > 0:
+            print(f"\nProcessing complete!")
+            print(f"Total processed: {total_unprocessed:,} rows")
+            print(f"Overall TPS: {total_unprocessed/total_duration:.1f}")
+            print(f"Total time: {total_duration/60:.1f} minutes")
         print(f"\nTotal processing time: {total_duration:.1f}s")
         
     finally:
