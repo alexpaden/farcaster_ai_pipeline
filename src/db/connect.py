@@ -183,34 +183,5 @@ class DatabaseConnection:
             self._conn = None
             logger.debug("Closed synchronous database connection")
 
-    # Benchmark-specific methods
-    async def reset_test_casts(self):
-        """Reset and populate test_casts table with 100k casts."""
-        print("\nResetting test_casts table...")
-        async with self.pool.acquire() as conn:
-            await conn.execute("""
-                TRUNCATE TABLE public.test_casts;
-                
-                INSERT INTO public.test_casts (id, text)
-                SELECT id, text
-                FROM public.casts
-                WHERE text IS NOT NULL 
-                AND length(trim(text)) > 0
-                ORDER BY id
-                LIMIT 100000;
-            """)
-        print("Test casts table reset complete.")
-
-    async def fetch_test_batch(self, limit: int = 100) -> List[Dict[str, Any]]:
-        """Fetch a batch of test casts."""
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT id, text 
-                FROM public.test_casts 
-                ORDER BY id
-                LIMIT $1
-            """, limit)
-            return [dict(row) for row in rows]
-
 # Create a singleton instance
 db = DatabaseConnection() 
