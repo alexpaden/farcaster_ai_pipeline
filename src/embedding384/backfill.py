@@ -323,12 +323,12 @@ class PrefetchMetrics:
         print(f"  Queue Depth: {self.queue_depth}")
         print(f"  Rows Fetched: {self.rows_fetched:,}")
 
-async def fetch_next_batch(pool, limit: int = 100) -> Tuple[List[Dict[str, Any]], float]:
-    """Fetch next batch of unprocessed casts."""
+async def fetch_next_batch(pool, limit: int = 200000) -> Tuple[List[Dict[str, Any]], float]:
+    """Fetch next batch of unprocessed casts using the fastest possible method."""
     fetch_start = time.time()
     async with pool.acquire() as conn:
         async with conn.transaction():
-            await conn.execute("SET statement_timeout = '60s'")
+            await conn.execute("SET statement_timeout = '400s'")
             
             select_start = time.time()
             rows = await conn.fetch("""
@@ -339,7 +339,8 @@ async def fetch_next_batch(pool, limit: int = 100) -> Tuple[List[Dict[str, Any]]
                         AND text IS NOT NULL 
                         AND length(trim(text)) > 0
                         AND (embedding384_updated_at IS NULL OR embedding384_updated_at < NOW() - interval '1 hour')
-                    ORDER BY RANDOM()  -- Changed from ORDER BY id
+                    -- No randomization needed - use your index directly
+                    ORDER BY id  
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
                 )
