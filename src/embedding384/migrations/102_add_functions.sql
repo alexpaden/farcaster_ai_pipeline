@@ -1,5 +1,5 @@
 -- Create function to encapsulate optimized count query
-CREATE OR REPLACE FUNCTION get_unprocessed_count()
+CREATE OR REPLACE FUNCTION unbias.get_unprocessed_count()
 RETURNS bigint AS $$
 BEGIN
     -- Set READ COMMITTED isolation to ensure we don't use stale data
@@ -13,7 +13,7 @@ BEGIN
         SELECT count(*) 
         FROM (
             SELECT 1 
-            FROM public.casts 
+            FROM farcaster.casts 
             WHERE embedding384 IS NULL 
             AND text IS NOT NULL 
             AND length(trim(text)) > 0

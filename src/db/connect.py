@@ -51,6 +51,12 @@ class DatabaseConnection:
         
         # Create migrations table if it doesn't exist
         async with self.pool.acquire() as conn:
+            # First ensure the unbias schema exists
+            await conn.execute("CREATE SCHEMA IF NOT EXISTS unbias;")
+            
+            # Set search path to ensure migrations table is created in unbias schema
+            await conn.execute("SET search_path TO unbias;")
+            
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS migrations (
                     id SERIAL PRIMARY KEY,
@@ -147,7 +153,8 @@ class DatabaseConnection:
                     max_size=8,  # Maximum connections per process
                     command_timeout=60,
                     server_settings={
-                        'application_name': f'farcaster_ai_pipeline_{os.getpid()}'
+                        'application_name': f'farcaster_ai_pipeline_{os.getpid()}',
+                        'search_path': 'unbias,farcaster,nindexer'
                     }
                 )
                 logger.debug("Created new asyncpg connection pool")

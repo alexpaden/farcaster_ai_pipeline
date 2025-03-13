@@ -288,10 +288,20 @@ def get_gpu_memory():
         return 0
 
 async def get_unprocessed_estimate(pool) -> int:
-    """Get current count of unprocessed rows."""
+    """Get current count of unprocessed rows using direct SQL query."""
+    start_time = time.time()
     async with pool.acquire() as conn:
+        # Use direct query instead of function call
         await conn.execute("SET statement_timeout = '60s'")
-        result = await conn.fetchval("SELECT get_unprocessed_count()")
+        result = await conn.fetchval("""
+            SELECT count(*) 
+            FROM farcaster.casts 
+            WHERE embedding384 IS NULL 
+              AND text IS NOT NULL 
+              AND length(trim(text)) > 0
+        """)
+        query_time = time.time() - start_time
+        print(f"Unprocessed count query took {query_time:.2f}s, found {int(result or 0):,} rows")
         return int(result or 0)
 
 @dataclass
@@ -324,7 +334,7 @@ async def fetch_next_batch(pool, limit: int = 100) -> Tuple[List[Dict[str, Any]]
             rows = await conn.fetch("""
                 WITH selected AS (
                     SELECT id, text
-                    FROM public.casts
+                    FROM farcaster.casts
                     WHERE embedding384 IS NULL 
                         AND text IS NOT NULL 
                         AND length(trim(text)) > 0
@@ -333,7 +343,7 @@ async def fetch_next_batch(pool, limit: int = 100) -> Tuple[List[Dict[str, Any]]
                     LIMIT $1
                     FOR UPDATE SKIP LOCKED
                 )
-                UPDATE casts c
+                UPDATE farcaster.casts c
                 SET embedding384_updated_at = NOW()
                 FROM selected s
                 WHERE c.id = s.id
@@ -591,7 +601,7 @@ async def update_embeddings(pool, batch_ids: List[int], embeddings: np.ndarray) 
                 
                 values_clause = ','.join(value_strings)
                 update_sql = f"""
-                    UPDATE casts AS t
+                    UPDATE farcaster.casts AS t
                     SET 
                         embedding384 = v.embedding::vector,
                         embedding384_updated_at = NOW()
@@ -813,7 +823,7 @@ async def reset_stale_rows(pool) -> int:
     async with pool.acquire() as conn:
         async with conn.transaction():
             result = await conn.fetch("""
-                UPDATE casts 
+                UPDATE farcaster.casts 
                 SET embedding384_updated_at = NULL
                 WHERE embedding384 IS NULL 
                     AND embedding384_updated_at IS NOT NULL 
