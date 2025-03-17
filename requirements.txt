@@ -1,11 +1,15 @@
 # Core dependencies
 --find-links https://download.pytorch.org/whl/torch_stable.html
-torch>=2.2.0
-transformers>=4.37.2
-sentence-transformers>=2.3.1
+torch==2.6.0
+transformers==4.48.1
+sentence-transformers==3.3.1
 numpy==1.26.3
 psutil==5.9.7
-accelerate>=0.27.0
+accelerate==1.3.0
+optimum==1.24.0
+optimum-quanto==0.2.7
+scikit-learn==1.6.1
+propcache==0.2.1
 
 # API and services
 fastapi==0.108.0
@@ -26,4 +30,11 @@ isort==5.13.2
 
 # Logging and monitoring
 python-json-logger==2.0.7
-python-dotenv==1.0.0 
+python-dotenv==1.0.0
+
+# Dependencies automatically installed
+pillow==11.1.0
+pydantic==2.10.5
+tqdm==4.67.1
+tokenizers==0.21.0
+huggingface-hub==0.27.1 

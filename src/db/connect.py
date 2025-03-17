@@ -139,7 +139,7 @@ class DatabaseConnection:
             finally:
                 cursor.close()
 
-    async def initialize_pool(self):
+    async def initialize_pool(self, command_timeout=120):
         """Initialize the asyncpg connection pool."""
         if self._pool is None:
             try:
@@ -151,7 +151,7 @@ class DatabaseConnection:
                     port=self.db_params['port'],
                     min_size=4,  # Minimum connections per process
                     max_size=8,  # Maximum connections per process
-                    command_timeout=60,
+                    command_timeout=command_timeout,
                     server_settings={
                         'application_name': f'farcaster_ai_pipeline_{os.getpid()}',
                         'search_path': 'unbias,farcaster,nindexer'
@@ -170,10 +170,10 @@ class DatabaseConnection:
             raise RuntimeError("Pool not initialized. Call initialize_pool() first.")
         return self._pool
 
-    async def get_pool(self):
+    async def get_pool(self, command_timeout=120):
         """Get or create an asyncpg connection pool."""
         if self._pool is None:
-            await self.initialize_pool()
+            await self.initialize_pool(command_timeout=command_timeout)
         return self._pool
 
     async def close_pool(self):

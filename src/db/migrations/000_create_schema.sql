@@ -6,3 +6,7 @@ CREATE SCHEMA IF NOT EXISTS public;
 
 -- Set search path to include unbias schema
 ALTER DATABASE neynar_parquet_importer SET search_path TO unbias, farcaster, nindexer, public;
+
+-- UPDATE farcaster.casts
+-- SET text = NULLIF(TRIM(text), '')
+-- WHERE text IS NOT NULL;
