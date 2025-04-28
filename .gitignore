@@ -23,6 +23,7 @@ wheels/
 # Virtual Environment
 .env
 .venv
+.env.pipeline
 env/
 venv/
 ENV/
