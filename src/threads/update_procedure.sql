@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE process_casts(
+CREATE OR REPLACE PROCEDURE farcaster.process_casts(
     p_batch_size   int  DEFAULT 100000,
     p_max_batches  int  DEFAULT NULL          -- NULL = run to completion
 )
@@ -43,6 +43,7 @@ BEGIN
                    WHERE  threads_status = 0
                      AND  "timestamp" < clock_timestamp() - INTERVAL '6 hours'
                    ORDER  BY "timestamp"
+                   FOR    UPDATE SKIP LOCKED
                    LIMIT  p_batch_size
              )
              RETURNING c.hash, c.fid, c."timestamp",
