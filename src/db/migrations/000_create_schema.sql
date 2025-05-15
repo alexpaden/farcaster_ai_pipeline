@@ -4,8 +4,11 @@ CREATE SCHEMA IF NOT EXISTS unbias;
 -- Create the public schema if it doesn't exist
 CREATE SCHEMA IF NOT EXISTS public;
 
+-- Create the vector extension if it doesn't exist
+CREATE EXTENSION IF NOT EXISTS vector;
+
 -- Set search path to include unbias schema
-ALTER DATABASE neynar_parquet_importer SET search_path TO unbias, farcaster, nindexer, public;
+--ALTER DATABASE neynar_parquet_importer SET search_path TO unbias, farcaster, nindexer, public;
 
 -- UPDATE farcaster.casts
 -- SET text = NULLIF(TRIM(text), '')

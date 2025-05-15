@@ -12,6 +12,7 @@ from contextlib import contextmanager
 from typing import List, Dict, Any
 from pathlib import Path
 import glob
+import re
 from .logger import setup_logging
 
 # Load environment variables
@@ -51,9 +52,7 @@ class DatabaseConnection:
         
         # Create migrations table if it doesn't exist
         async with self.pool.acquire() as conn:
-            # First ensure the unbias schema exists
-            await conn.execute("CREATE SCHEMA IF NOT EXISTS unbias;")
-            
+           
             # Set search path to ensure migrations table is created in unbias schema
             await conn.execute("SET search_path TO unbias;")
             
@@ -78,8 +77,17 @@ class DatabaseConnection:
                     
                     # Read and execute migration
                     with open(path, 'r') as f:
-                        sql = f.read()
-                        await conn.execute(sql)
+                        original_sql = f.read()
+                        # Strip "CONCURRENTLY" from CREATE INDEX statements
+                        modified_sql = re.sub(r"CREATE\s+(UNIQUE\s+)?INDEX\s+CONCURRENTLY", 
+                                              r"CREATE \1INDEX", 
+                                              original_sql, 
+                                              flags=re.IGNORECASE)
+                        
+                        if original_sql != modified_sql:
+                            print(f"  INFO: Removed CONCURRENTLY from index creation in {filename}")
+                        
+                        await conn.execute(modified_sql)
                     
                     # Record migration
                     module = os.path.basename(os.path.dirname(os.path.dirname(path))) if module_path else None
