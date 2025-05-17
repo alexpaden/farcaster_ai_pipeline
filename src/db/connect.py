@@ -147,8 +147,10 @@ class DatabaseConnection:
             finally:
                 cursor.close()
 
-    async def initialize_pool(self, command_timeout=120):
-        """Initialize the asyncpg connection pool."""
+    async def initialize_pool(self, min_size=None, max_size=None, command_timeout=120):
+        """Initialize the asyncpg connection pool with configurable size."""
+        min_size = min_size if min_size is not None else 4
+        max_size = max_size if max_size is not None else 8
         if self._pool is None:
             try:
                 self._pool = await asyncpg.create_pool(
@@ -157,15 +159,15 @@ class DatabaseConnection:
                     password=self.db_params['password'],
                     host=self.db_params['host'],
                     port=self.db_params['port'],
-                    min_size=4,  # Minimum connections per process
-                    max_size=8,  # Maximum connections per process
+                    min_size=min_size,
+                    max_size=max_size,
                     command_timeout=command_timeout,
                     server_settings={
                         'application_name': f'farcaster_ai_pipeline_{os.getpid()}',
                         'search_path': 'unbias,farcaster,nindexer'
                     }
                 )
-                logger.debug("Created new asyncpg connection pool")
+                logger.debug(f"Created new asyncpg connection pool (min_size={min_size}, max_size={max_size})")
             except Exception as e:
                 logger.error(f"Error creating asyncpg pool: {str(e)}")
                 raise
