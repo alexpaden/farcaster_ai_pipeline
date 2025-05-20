@@ -18,11 +18,9 @@ BEGIN
         author_fid INT NULL,
         timestamp TIMESTAMP WITH TIME ZONE NULL, -- Renamed from created_at
         threads_status SMALLINT DEFAULT 0,     -- 0=Unclaimed, 1=Claimed, 2=Processed, 3=Failed
-        claimed_at TIMESTAMP WITH TIME ZONE NULL -- Timestamp when claimed by a worker
+        claimed_at TIMESTAMP WITH TIME ZONE NULL, -- Timestamp when claimed by a worker
+        spam SMALL INT -- denormalized spam label column
     );
 
-    -- Note: The PRIMARY KEY constraint is now part of the CREATE TABLE definition
-    -- ALTER TABLE unbias.threads
-    --   ADD CONSTRAINT threads_pkey PRIMARY KEY (hash);
   END IF;
 END $$;

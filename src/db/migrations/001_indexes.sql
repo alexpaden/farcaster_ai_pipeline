@@ -17,3 +17,8 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_labels_target_fid_label_value
 -- Index for casts table to optimize joins in unbias.reaction_counts view (comment_counts CTE)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_casts_fid 
   ON farcaster.casts (fid);
+
+  -- (Optional but tiny) keep only the "label_value = 2" rows hot
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_user_labels_lbl2
+  ON farcaster.user_labels (target_fid)
+  WHERE label_value = '2';
