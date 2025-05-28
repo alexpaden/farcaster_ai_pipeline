@@ -3,13 +3,11 @@
 -- 1. Combine data fetching with thread building
 -- 2. Simplify subtree popularity calculation
 -- 3. Inline quote parsing to avoid extra joins
--- 4. Use EXISTS for spam filtering to avoid large hash tables
--- 5. Simplify OP interaction detection
+-- 4. Pre-calculate all reaction counts to avoid repeated good_fids lookups
 
 BEGIN;
 SET LOCAL jit = off;
 SET LOCAL work_mem = '256MB';
-
 WITH
 -------------------------------------------------------------------------------
 -- 0) Root cast's hash
@@ -49,11 +47,8 @@ thread_reactions AS (
     r.target_hash AS hash,
     COUNT(*) AS reaction_count
   FROM farcaster.reactions r
+  JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
   WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
-    AND EXISTS (
-      SELECT 1 FROM farcaster.user_labels ul 
-      WHERE ul.target_fid = r.fid AND ul.label_value::int = 2
-    )
   GROUP BY r.target_hash
 ),
 
@@ -71,23 +66,31 @@ thread_with_data AS (
 ),
 
 -------------------------------------------------------------------------------
--- 4) Get OP interactions and filter nodes more efficiently
+-- 4) Get OP interactions and filter nodes
 -------------------------------------------------------------------------------
 filtered_thread AS (
-  SELECT DISTINCT t.*
+  -- Mark nodes that OP interacted with
+  WITH op_interactions AS (
+    SELECT DISTINCT t.hash
+    FROM thread_with_data t
+    WHERE t.fid = t.op_fid -- OP authored
+    
+    UNION
+    
+    SELECT DISTINCT t.hash
+    FROM thread_with_data t
+    JOIN farcaster.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
+  ),
+  -- Get all ancestors of needed nodes using path arrays
+  all_needed AS (
+    SELECT DISTINCT ancestor_hash
+    FROM op_interactions oi
+    JOIN thread_with_data t ON t.hash = oi.hash
+    CROSS JOIN LATERAL UNNEST(t.path) AS ancestor_hash
+  )
+  SELECT t.*
   FROM thread_with_data t
-  WHERE EXISTS (
-    -- Include if any descendant was authored by OP
-    SELECT 1 FROM thread_with_data t2
-    WHERE t2.path @> ARRAY[t.hash] 
-      AND t2.fid = t2.op_fid
-  )
-  OR EXISTS (
-    -- Include if any descendant was reacted to by OP
-    SELECT 1 FROM thread_with_data t3
-    JOIN farcaster.reactions r ON r.target_hash = t3.hash AND r.fid = t3.op_fid
-    WHERE t3.path @> ARRAY[t.hash]
-  )
+  JOIN all_needed an ON t.hash = an.ancestor_hash
 ),
 
 -------------------------------------------------------------------------------
