@@ -18,3 +18,27 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_ts_spam2
     WHERE spam = 2;
 
 
+-- Composite index for batch processing selection
+-- This is the most critical index for the process_thread_batches procedure
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_batch_processing
+    ON unbias.threads (threads_status, spam, "timestamp")
+    WHERE threads_status = 0 AND spam = 2;
+
+-- Index on author_fid for spam label sync and potential filtering
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_author_fid
+    ON unbias.threads (author_fid);
+
+-- Index on claimed_at for monitoring/debugging stuck threads
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_claimed_at
+    ON unbias.threads (claimed_at)
+    WHERE threads_status = 1;  -- Only for claimed threads
+
+-- Index on reactions for potential sorting/filtering by popularity
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_reactions
+    ON unbias.threads (reactions DESC)
+    WHERE spam = 2;  -- Only for non-spam threads
+
+-- Partial index for processed threads that might be queried
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_processed
+    ON unbias.threads ("timestamp" DESC)
+    WHERE threads_status = 1 AND spam = 2;
