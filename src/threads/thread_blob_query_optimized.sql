@@ -81,11 +81,29 @@ filtered_thread AS (
     FROM thread_with_data t
     JOIN farcaster.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
   ),
+  -- Get top 5% most popular posts (minimum 1)
+  popular_extras AS (
+    SELECT hash
+    FROM (
+      SELECT
+        hash,
+        reaction_count,
+        ROW_NUMBER() OVER (ORDER BY reaction_count DESC) AS rn,
+        COUNT(*) OVER () AS total
+      FROM thread_with_data
+      WHERE reaction_count > 0  -- Only consider posts with reactions
+    ) s
+    WHERE rn <= GREATEST(1, CEIL(total * 0.05))  -- top 5%, but never 0 rows
+  ),
   -- Get all ancestors of needed nodes using path arrays
   all_needed AS (
     SELECT DISTINCT ancestor_hash
-    FROM op_interactions oi
-    JOIN thread_with_data t ON t.hash = oi.hash
+    FROM (
+      SELECT hash FROM op_interactions
+      UNION
+      SELECT hash FROM popular_extras  -- Include popular posts
+    ) x
+    JOIN thread_with_data t ON t.hash = x.hash
     CROSS JOIN LATERAL UNNEST(t.path) AS ancestor_hash
   )
   SELECT t.*
