@@ -196,24 +196,36 @@ BEGIN
                     SELECT
                       wp.*,
                       ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
-                      -- Parse quotes inline - only if embeds exist and have the right structure
-                      CASE 
-                        WHEN wp.embeds IS NOT NULL 
-                         AND wp.embeds::text != '[]' 
-                         AND wp.embeds::text LIKE '%castId%' THEN
-                          (
-                            WITH embed_data AS (
-                              SELECT DECODE(
-                                STRING_AGG(LPAD(TO_HEX(elem::int), 2, '0'), ''), 'hex'
-                              ) AS embed_hash
-                              FROM JSON_ARRAY_ELEMENTS_TEXT(wp.embeds::json->0->'castId'->'hash'->'data') AS elem
-                            )
-                            SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                            FROM embed_data ed
-                            LEFT JOIN farcaster.casts c ON c.hash = ed.embed_hash
-                            LEFT JOIN nindexer.profiles p ON c.fid = p.fid
-                            LIMIT 1
-                          )
+                      -- Parse quotes inline using regex to handle malformed JSON
+                      CASE
+                        WHEN wp.embeds::text <> '"[]"' 
+                         AND wp.embeds::text LIKE '%castId%'                 -- fast pre-filter
+                        THEN (
+                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
+                             2. Split to individual numbers
+                             3. int → hex → string_agg → DECODE → bytea  */
+                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
+                          FROM  LATERAL (
+                                  SELECT DECODE(
+                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
+                                           'hex'
+                                         ) AS embed_hash
+                                  FROM   UNNEST(
+                                           STRING_TO_ARRAY(
+                                             ( REGEXP_MATCH(
+                                                 -- Remove outer quotes if present
+                                                 TRIM(BOTH '"' FROM wp.embeds::TEXT),
+                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
+                                               )
+                                             )[1]                                         -- the capture group
+                                             , ','
+                                           )
+                                         ) AS n
+                                ) h
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
+                          LIMIT 1
+                        )
                         ELSE NULL
                       END AS quote_text
                     FROM with_popularity wp
@@ -225,23 +237,35 @@ BEGIN
                     SELECT
                       child.*,
                       parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
-                      CASE 
-                        WHEN child.embeds IS NOT NULL 
-                         AND child.embeds::text != '[]' 
-                         AND child.embeds::text LIKE '%castId%' THEN
-                          (
-                            WITH embed_data AS (
-                              SELECT DECODE(
-                                STRING_AGG(LPAD(TO_HEX(elem::int), 2, '0'), ''), 'hex'
-                              ) AS embed_hash
-                              FROM JSON_ARRAY_ELEMENTS_TEXT(child.embeds::json->0->'castId'->'hash'->'data') AS elem
-                            )
-                            SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                            FROM embed_data ed
-                            LEFT JOIN farcaster.casts c ON c.hash = ed.embed_hash
-                            LEFT JOIN nindexer.profiles p ON c.fid = p.fid
-                            LIMIT 1
-                          )
+                      CASE
+                        WHEN child.embeds::text <> '"[]"' 
+                         AND child.embeds::text LIKE '%castId%'                 -- fast pre-filter
+                        THEN (
+                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
+                             2. Split to individual numbers
+                             3. int → hex → string_agg → DECODE → bytea  */
+                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
+                          FROM  LATERAL (
+                                  SELECT DECODE(
+                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
+                                           'hex'
+                                         ) AS embed_hash
+                                  FROM   UNNEST(
+                                           STRING_TO_ARRAY(
+                                             ( REGEXP_MATCH(
+                                                 -- Remove outer quotes if present
+                                                 TRIM(BOTH '"' FROM child.embeds::TEXT),
+                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
+                                               )
+                                             )[1]                                         -- the capture group
+                                             , ','
+                                           )
+                                         ) AS n
+                                ) h
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
+                          LIMIT 1
+                        )
                         ELSE NULL
                       END
                     FROM with_popularity child
@@ -262,7 +286,15 @@ BEGIN
                       ': ',
                       CASE 
                         WHEN st.quote_text IS NOT NULL THEN
-                          REGEXP_REPLACE(st.text, 'https:\/\/warpcast\.com\/[^ ]+\/0x[0-9A-Fa-f]{8,}', st.quote_text, 'g')
+                          -- Try to replace URL first, if no replacement happens, append quote at end
+                          CASE
+                            WHEN st.text ~ 'https:\/\/warpcast\.com\/[^ ]+\/0x[0-9A-Fa-f]{8,}' THEN
+                              -- URL exists, replace it
+                              REGEXP_REPLACE(st.text, 'https:\/\/warpcast\.com\/[^ ]+\/0x[0-9A-Fa-f]{8,}', st.quote_text, 'g')
+                            ELSE
+                              -- No URL, append quote at end
+                              CONCAT(st.text, ' ', st.quote_text)
+                          END
                         ELSE st.text
                       END
                     ),
@@ -401,24 +433,36 @@ BEGIN
                     SELECT
                       wp.*,
                       ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
-                      -- Parse quotes inline - only if embeds exist and have the right structure
-                      CASE 
-                        WHEN wp.embeds IS NOT NULL 
-                         AND wp.embeds::text != '[]' 
-                         AND wp.embeds::text LIKE '%castId%' THEN
-                          (
-                            WITH embed_data AS (
-                              SELECT DECODE(
-                                STRING_AGG(LPAD(TO_HEX(elem::int), 2, '0'), ''), 'hex'
-                              ) AS embed_hash
-                              FROM JSON_ARRAY_ELEMENTS_TEXT(wp.embeds::json->0->'castId'->'hash'->'data') AS elem
-                            )
-                            SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                            FROM embed_data ed
-                            LEFT JOIN farcaster.casts c ON c.hash = ed.embed_hash
-                            LEFT JOIN nindexer.profiles p ON c.fid = p.fid
-                            LIMIT 1
-                          )
+                      -- Parse quotes inline using regex to handle malformed JSON
+                      CASE
+                        WHEN wp.embeds::text <> '"[]"' 
+                         AND wp.embeds::text LIKE '%castId%'                 -- fast pre-filter
+                        THEN (
+                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
+                             2. Split to individual numbers
+                             3. int → hex → string_agg → DECODE → bytea  */
+                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
+                          FROM  LATERAL (
+                                  SELECT DECODE(
+                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
+                                           'hex'
+                                         ) AS embed_hash
+                                  FROM   UNNEST(
+                                           STRING_TO_ARRAY(
+                                             ( REGEXP_MATCH(
+                                                 -- Remove outer quotes if present
+                                                 TRIM(BOTH '"' FROM wp.embeds::TEXT),
+                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
+                                               )
+                                             )[1]                                         -- the capture group
+                                             , ','
+                                           )
+                                         ) AS n
+                                ) h
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
+                          LIMIT 1
+                        )
                         ELSE NULL
                       END AS quote_text
                     FROM with_popularity wp
@@ -430,23 +474,35 @@ BEGIN
                     SELECT
                       child.*,
                       parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
-                      CASE 
-                        WHEN child.embeds IS NOT NULL 
-                         AND child.embeds::text != '[]' 
-                         AND child.embeds::text LIKE '%castId%' THEN
-                          (
-                            WITH embed_data AS (
-                              SELECT DECODE(
-                                STRING_AGG(LPAD(TO_HEX(elem::int), 2, '0'), ''), 'hex'
-                              ) AS embed_hash
-                              FROM JSON_ARRAY_ELEMENTS_TEXT(child.embeds::json->0->'castId'->'hash'->'data') AS elem
-                            )
-                            SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                            FROM embed_data ed
-                            LEFT JOIN farcaster.casts c ON c.hash = ed.embed_hash
-                            LEFT JOIN nindexer.profiles p ON c.fid = p.fid
-                            LIMIT 1
-                          )
+                      CASE
+                        WHEN child.embeds::text <> '"[]"' 
+                         AND child.embeds::text LIKE '%castId%'                 -- fast pre-filter
+                        THEN (
+                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
+                             2. Split to individual numbers
+                             3. int → hex → string_agg → DECODE → bytea  */
+                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
+                          FROM  LATERAL (
+                                  SELECT DECODE(
+                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
+                                           'hex'
+                                         ) AS embed_hash
+                                  FROM   UNNEST(
+                                           STRING_TO_ARRAY(
+                                             ( REGEXP_MATCH(
+                                                 -- Remove outer quotes if present
+                                                 TRIM(BOTH '"' FROM child.embeds::TEXT),
+                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
+                                               )
+                                             )[1]                                         -- the capture group
+                                             , ','
+                                           )
+                                         ) AS n
+                                ) h
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
+                          LIMIT 1
+                        )
                         ELSE NULL
                       END
                     FROM with_popularity child
