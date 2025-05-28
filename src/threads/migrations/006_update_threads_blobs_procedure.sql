@@ -18,6 +18,7 @@ BEGIN
         
         -- Set these for each iteration since COMMIT resets transaction-local settings
         SET LOCAL jit = off;
+        SET LOCAL synchronous_commit = off;
         SET LOCAL work_mem = '256MB';
 
         WITH 
