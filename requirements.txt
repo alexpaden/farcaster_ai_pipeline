@@ -10,6 +10,7 @@ optimum==1.24.0
 optimum-quanto==0.2.7
 scikit-learn==1.6.1
 propcache==0.2.1
+tiktoken==0.5.2
 
 # API and services
 fastapi==0.108.0
