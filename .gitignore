@@ -1,3 +1,9 @@
+# Virtual Environment
+venv/
+env/
+.venv/
+.env/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -20,22 +26,34 @@ wheels/
 .installed.cfg
 *.egg
 
-# Virtual Environment
+# Environment variables
 .env
-.venv
-.env.pipeline
-env/
-venv/
-ENV/
+.env.local
 
 # IDE
-.idea/
 .vscode/
+.idea/
 *.swp
 *.swo
+*~
 
-# Project specific
-logs/
-results/
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
 *.log
-.DS_Store 
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json 
