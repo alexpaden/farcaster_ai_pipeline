@@ -51,4 +51,4 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_embedding_claimed
 -- Index for threads with completed embeddings (status = 3)
 CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_embedding_complete
     ON unbias.threads ("timestamp" DESC)
-    WHERE threads_status = 3;
+    WHERE threads_status = 3 and spam = 2;
