@@ -119,77 +119,108 @@ class ThreadEmbeddingWorker:
                 raise SystemExit("Too many consecutive database errors")
             raise
     
-    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, np.ndarray]], List[bytes], List[bytes], List[bytes]]:
+    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, np.ndarray]], List[bytes]]:
         """Process a batch of texts and generate embeddings
         
+        Args:
+            batch: List of (hash, blob) tuples where hash is bytes
+            
         Returns:
-            Tuple of (successful, failed, blank, retry) where successful has (hash, embedding) pairs,
-            failed are hashes that failed API permanently, blank are hashes with empty text, retry are hashes to be reset to status 1
+            Tuple of (successful, failed) where successful has (hash, embedding) pairs
+            
+        Note:
+            Handles Voyage API rate limits (HTTP 429) with exponential backoff.
+            Voyage returns 429 when hitting per-minute rate or concurrency limits.
+            Our retry logic waits and retries up to max_retries times.
         """
         if not batch:
-            return [], [], [], []
+            return [], []
         
         hashes = [item[0] for item in batch]
         texts = [item[1] for item in batch]
         
+        # Replace "↳" with "-" and filter out empty texts
+        # Voyage API doesn't accept empty strings
         valid_indices = []
         processed_texts = []
-        blank_hashes = []
+        empty_hashes = []
         
         for i, text in enumerate(texts):
-            if text and text.strip():
+            if text and text.strip():  # Check if text exists and is not just whitespace
                 processed_text = text.replace("↳", "-")
                 processed_texts.append(processed_text)
                 valid_indices.append(i)
             else:
-                blank_hashes.append(hashes[i])
+                # Track empty texts as failed
+                empty_hashes.append(hashes[i])
         
+        # If all texts are empty, return all as failed
         if not processed_texts:
             self.logger.warning(f"All {len(batch)} texts in batch were empty")
-            return [], [], hashes, []
+            return [], hashes
         
-        if blank_hashes:
-            self.logger.warning(f"Skipping {len(blank_hashes)} empty texts in batch of {len(batch)}")
+        # Log if we had to skip some empty texts
+        if empty_hashes:
+            self.logger.warning(f"Skipping {len(empty_hashes)} empty texts in batch of {len(batch)}")
         
+        # Retry logic for API calls
         max_retries = 3
-        retry_delay = 1.0
+        retry_delay = 1.0  # Start with 1 second
+        
         for attempt in range(max_retries):
             try:
+                # Generate embeddings using VoyageAI
                 result = await self.voyage_client.embed(
                     processed_texts, 
                     model=VOYAGE_MODEL,
                     input_type="document",
                     output_dimension=512
                 )
+                
+                # Convert embeddings to numpy arrays
                 embeddings = [np.array(emb, dtype=np.float32) for emb in result.embeddings]
+                
+                # Verify dimensions on first successful batch (silently)
                 if embeddings and self.batches_processed == 0:
                     actual_dim = len(embeddings[0])
                     if actual_dim != EMBEDDING_DIM:
                         self.logger.error(f"Dimension mismatch! voyage-3.5-lite returned {actual_dim}D embeddings, but database expects {EMBEDDING_DIM}D")
+                
+                # Pair hashes with embeddings - only for valid indices
                 successful = [(hashes[valid_indices[i]], embeddings[i]) for i in range(len(embeddings))]
-                failed = []
+                
+                # Combine empty texts with any other failures
+                failed = empty_hashes
+                
+                # Reset consecutive errors on success
                 self.consecutive_errors = 0
-                return successful, failed, blank_hashes, []
+                return successful, failed
+                
             except Exception as e:
                 error_msg = str(e).lower()
+                # Voyage API returns HTTP 429 when hitting rate/concurrency limits
                 is_rate_limit = any(term in error_msg for term in ['rate limit', 'too many requests', '429'])
-                is_server_overload = any(term in error_msg for term in ['server is overloaded', 'not ready yet', 'server error', '503'])
+                
                 if attempt < max_retries - 1:
-                    wait_time = retry_delay * (2 ** attempt) if is_rate_limit else retry_delay
+                    # Determine wait time based on error type
+                    if is_rate_limit:
+                        wait_time = retry_delay * (2 ** attempt)  # Exponential backoff
+                    else:
+                        wait_time = retry_delay
+                    
                     await asyncio.sleep(wait_time)
                 else:
+                    # Final attempt failed
                     self.logger.error(f"Failed to generate embeddings after {max_retries} attempts: {e}")
                     self.consecutive_errors += 1
                     if self.consecutive_errors >= MAX_CONSECUTIVE_ERRORS:
                         self.logger.error(f"Too many consecutive API errors ({MAX_CONSECUTIVE_ERRORS}), shutting down")
                         raise SystemExit("Too many consecutive API errors")
-                    if is_server_overload:
-                        # Mark for retry (status 1)
-                        return [], [], blank_hashes, hashes
-                    else:
-                        # Permanent error
-                        return [], hashes, blank_hashes, []
-        return [], hashes, blank_hashes, []
+                    # All items in batch failed - hashes already bytes
+                    return [], hashes
+        
+        # Should never reach here, but just in case
+        return [], hashes
     
     async def update_embeddings(self, successful: List[Tuple[bytes, np.ndarray]]):
         """Update database with successful embeddings
@@ -239,74 +270,104 @@ class ThreadEmbeddingWorker:
                 raise SystemExit("Too many consecutive database errors")
             raise
     
-    async def mark_failed(self, failed_hashes: List[bytes], status: int = 4):
-        """Mark failed items with status 4 (API error), 5 (blank text), or 1 (retry)"""
+    async def mark_failed(self, failed_hashes: List[bytes]):
+        """Mark failed items with status 4
+        
+        Args:
+            failed_hashes: List of hash values as bytes objects
+        """
         if not failed_hashes:
             return
+        
         try:
             async with db.pool.acquire() as conn:
                 async with conn.transaction():
-                    await conn.execute(f"""
+                    result = await conn.execute("""
                         UPDATE unbias.threads
-                        SET    threads_status = {status}
+                        SET    threads_status = 4
                         WHERE  hash = ANY($1);
                     """, failed_hashes)
+                    
+                    # Only log for debugging if many failures
                     if len(failed_hashes) > 100:
-                        self.logger.warning(f"Marked {len(failed_hashes)} items as failed (status {status})")
+                        self.logger.warning(f"Marked {len(failed_hashes)} items as failed")
         except Exception as e:
             self.logger.error(f"Database error marking failures: {e}")
+            # Don't increment consecutive errors for this operation
     
     async def run(self):
         """Main worker loop"""
         current_batch_hashes = []
+        
+        # Timing accumulators
         total_claim_time = 0
         total_api_time = 0
         total_update_time = 0
         total_batches = 0
+        
         try:
+            # max_batches=0 means unlimited processing
             while self.max_batches == 0 or self.batches_processed < self.max_batches:
+                # Time the claim operation
                 claim_start = time.time()
                 batch = await self.claim_batch()
                 claim_time = time.time() - claim_start
                 total_claim_time += claim_time
+                
                 if not batch:
+                    # No more rows to process
                     break
+                
+                # Track current batch for crash recovery
                 current_batch_hashes = [item[0] for item in batch]
+                
+                # Time the API call
                 api_start = time.time()
-                successful, failed, blank, retry = await self.process_batch(batch)
+                successful, failed = await self.process_batch(batch)
                 api_time = time.time() - api_start
                 total_api_time += api_time
+                
+                # Time the database updates
                 update_start = time.time()
                 await self.update_embeddings(successful)
-                await self.mark_failed(failed, status=4)
-                await self.mark_failed(blank, status=5)
-                await self.mark_failed(retry, status=1)
+                await self.mark_failed(failed)
                 update_time = time.time() - update_start
                 total_update_time += update_time
+                
+                # Clear current batch after successful processing
                 current_batch_hashes = []
+                
                 self.batches_processed += 1
                 total_batches += 1
+                
+                # Log timing info for every batch
                 avg_claim = total_claim_time / total_batches
                 avg_api = total_api_time / total_batches
                 avg_update = total_update_time / total_batches
                 total_per_batch = avg_claim + avg_api + avg_update
+                
                 self.logger.info(
                     f"Worker {self.worker_id} timing (avg per batch): "
                     f"claim={avg_claim:.2f}s, api={avg_api:.2f}s, update={avg_update:.2f}s, "
                     f"total={total_per_batch:.2f}s ({self.batch_size/total_per_batch:.0f} rows/sec)"
                 )
+                
+                # In test mode, exit after first batch
                 if self.test_mode:
                     break
+                    
         except SystemExit:
+            # Re-raise to propagate shutdown
             raise
         except Exception as e:
             self.logger.error(f"Worker {self.worker_id} crashed: {e}", exc_info=True)
             raise
         finally:
+            # If we have a batch in progress, mark it as failed
             if current_batch_hashes:
                 self.logger.warning(f"Worker {self.worker_id} crashed with {len(current_batch_hashes)} items in progress, marking as failed")
                 try:
-                    await self.mark_failed(current_batch_hashes, status=1)
+                    await self.mark_failed(current_batch_hashes)
                 except Exception as e:
                     self.logger.error(f"Failed to mark crashed batch as failed: {e}")
 
@@ -338,46 +399,15 @@ async def main(args):
         module_migrations_path = str(Path(__file__).parent)
         await db.run_migrations(module_path=module_migrations_path)
         
-        # Get API keys (comma-delimited)
-        api_keys_str = os.getenv("VOYAGE_API_KEY")
-        if not api_keys_str:
-            logger.error("VOYAGE_API_KEY environment variable not set")
-            return
-        
-        # Debug logging
-        logger.info(f"Raw API keys string: {repr(api_keys_str)}")
-        logger.info(f"Raw API keys string length: {len(api_keys_str)}")
-        logger.info(f"First 50 chars: {api_keys_str[:50]}...")
-        logger.info(f"Contains commas: {api_keys_str.count(',')}")
-        logger.info(f"Contains semicolons: {api_keys_str.count(';')}")
-        logger.info(f"Contains spaces: {api_keys_str.count(' ')}")
-        
-        # Parse API keys - try different delimiters
-        if ',' in api_keys_str:
-            api_keys = [key.strip() for key in api_keys_str.split(',') if key.strip()]
-        elif ';' in api_keys_str:
-            api_keys = [key.strip() for key in api_keys_str.split(';') if key.strip()]
-        elif ' ' in api_keys_str and 'Bearer' not in api_keys_str:
-            # Space-delimited, but not if it contains "Bearer" (single key with prefix)
-            api_keys = [key.strip() for key in api_keys_str.split(' ') if key.strip()]
-        else:
-            # Single key
-            api_keys = [api_keys_str.strip()]
-            
-        logger.info(f"Found {len(api_keys)} API key(s)")
+        # Initialize VoyageAI client
+        voyage_client = voyageai.AsyncClient()
         
         # Create progress tracker
         progress_tracker = ProgressTracker()
         
-        # Create workers with different API keys
+        # Create workers
         workers = []
         for i in range(args.workers):
-            # Rotate through available API keys
-            api_key = api_keys[i % len(api_keys)]
-            
-            # Create a separate VoyageAI client for each worker
-            voyage_client = voyageai.AsyncClient(api_key=api_key)
-            
             worker = ThreadEmbeddingWorker(
                 worker_id=i,
                 voyage_client=voyage_client,
@@ -387,9 +417,6 @@ async def main(args):
                 test_mode=args.test
             )
             workers.append(worker)
-            
-            # Log which API key this worker is using (just the index for security)
-            logger.info(f"Worker {i} using API key #{i % len(api_keys) + 1}")
         
         # Log configuration
         logger.info(f"Starting {args.workers} workers with batch_size={args.batch_size}, max_batches={args.max_batches}")
