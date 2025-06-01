@@ -14,6 +14,9 @@ import pyarrow.parquet as pq
 import asyncpg
 from datetime import datetime
 import logging
+import time
+import glob
+import gc
 
 # Add parent directory to path to import from src
 import sys
@@ -26,11 +29,12 @@ from src.db.logger import setup_logging
 logger = setup_logging()
 
 # Configuration
-ROWS_PER_CHUNK = 5_000_000      # Fetch and write 5M rows at a time
-OUTPUT_DIR = Path("../../data")   # Output directory
+ROWS_PER_CHUNK = 250_000      # Process this many rows at a time in memory
+ROWS_PER_FILE = 2_000_000       # 100k rows per file for testing
+OUTPUT_DIR = Path("data/threads")   # Output directory
 
-# The base query to execute (no ORDER BY for speed, but can add if needed)
-BASE_QUERY = """
+# The query to execute
+QUERY = """
 SELECT 
     hash, 
     fids, 
@@ -39,12 +43,10 @@ SELECT
     "timestamp", 
     claimed_at, 
     "blob", 
-    blob_embedding, 
-    blob_embedding_fp16
+    blob_embedding
 FROM unbias.threads
 WHERE threads_status = 3 AND spam = 2
 ORDER BY timestamp
-LIMIT {limit} OFFSET {offset}
 """
 
 
@@ -60,14 +62,26 @@ async def get_total_row_count(conn):
 
 
 async def export_to_parquet():
-    """Main export function."""
+    """Main export function with resume capability."""
     # Ensure output directory exists
     OUTPUT_DIR.mkdir(exist_ok=True)
     
-    # Clean up any existing parquet files
-    for f in OUTPUT_DIR.glob("*.parquet"):
-        f.unlink()
-        logger.info(f"Removed existing file: {f}")
+    # Clean up any existing parquet files that are incomplete (optional, not implemented here)
+    # Scan for existing files to resume
+    existing_files = sorted(OUTPUT_DIR.glob("threads-part-*.parquet"))
+    if existing_files:
+        last_file = existing_files[-1]
+        last_file_idx = int(str(last_file.name).split('-part-')[1].split('.')[0])
+        file_idx = last_file_idx + 1  # Start with the NEXT file
+        rows_processed = file_idx * ROWS_PER_FILE  # Already processed up to this point
+        logger.info(f"Resuming from file {last_file.name}, skipping {rows_processed:,} rows.")
+        logger.info(f"Next file to write: threads-part-{file_idx:05d}.parquet")
+    else:
+        file_idx = 0
+        rows_processed = 0
+        logger.info("No existing files found, starting from the beginning.")
+    rows_in_batch = 0
+    batch_dfs = []
     
     # Initialize the database pool with longer timeout
     await db.initialize_pool(min_size=4, max_size=16, command_timeout=600)
@@ -76,38 +90,112 @@ async def export_to_parquet():
         async with db.pool.acquire() as conn:
             # Get total row count
             total_rows = await get_total_row_count(conn)
-            n_chunks = math.ceil(total_rows / ROWS_PER_CHUNK)
-            logger.info(f"Exporting {total_rows:,} rows in {n_chunks} chunk(s) of {ROWS_PER_CHUNK:,} rows each")
+            n_files = math.ceil(total_rows / ROWS_PER_FILE)
+            logger.info(f"Exporting {total_rows:,} rows -> {n_files} parquet file(s)")
             
-            rows_processed = 0
-            for chunk_idx in range(n_chunks):
-                offset = chunk_idx * ROWS_PER_CHUNK
-                query = BASE_QUERY.format(limit=ROWS_PER_CHUNK, offset=offset)
-                logger.info(f"Fetching chunk {chunk_idx+1}/{n_chunks} (OFFSET {offset})")
-                rows = await conn.fetch(query)
-                if not rows:
-                    logger.info(f"No more rows at chunk {chunk_idx+1}, stopping early.")
-                    break
-                columns = list(rows[0].keys()) if rows else []
-                if chunk_idx == 0:
-                    logger.info(f"Columns: {columns}")
-                data = [dict(row) for row in rows]
-                df = pd.DataFrame(data)
-                import pyarrow.dataset as ds
-                table = pa.Table.from_pandas(df, preserve_index=False)
-                file_path = OUTPUT_DIR / f"threads-part-{chunk_idx:05d}.parquet"
-                ds.write_dataset(
-                    table,
-                    base_dir=OUTPUT_DIR,
-                    basename_template=f"threads-part-{chunk_idx:05d}.parquet",
-                    format="parquet",
-                    compression="snappy",
-                    existing_data_behavior="overwrite_or_ignore"
-                )
-                file_size_mb = file_path.stat().st_size / (1024 * 1024)
-                logger.info(f"Wrote {file_path.name} ({len(df):,} rows, {file_size_mb:.1f} MB)")
-                rows_processed += len(df)
-                logger.info(f"Processed {rows_processed:,}/{total_rows:,} rows ({rows_processed/total_rows*100:.1f}%)")
+            # Set up cursor for streaming results
+            async with conn.transaction():
+                # Create a cursor that will stream results, with OFFSET for resume
+                resume_query = QUERY + f" OFFSET {rows_processed}"
+                cursor = await conn.cursor(resume_query)
+                
+                # Process rows in chunks
+                while True:
+                    # Fetch a chunk of rows
+                    t0 = time.time()
+                    rows = await cursor.fetch(ROWS_PER_CHUNK)
+                    t1 = time.time()
+                    logger.info(f"DB fetch took {t1-t0:.2f} seconds for {len(rows):,} rows")
+                    if not rows:
+                        break
+                    
+                    # Convert to DataFrame
+                    # Extract column names from the first row if we haven't already
+                    if rows_processed == 0 and file_idx == 0:
+                        columns = list(rows[0].keys())
+                        logger.info(f"Columns: {columns}")
+                    
+                    # Convert rows to list of dicts for pandas
+                    t2 = time.time()
+                    data = [dict(row) for row in rows]
+                    df = pd.DataFrame(data)
+                    t3 = time.time()
+                    logger.info(f"DataFrame construction took {t3-t2:.2f} seconds")
+                    
+                    batch_dfs.append(df)
+                    rows_in_batch += len(df)
+                    rows_processed += len(df)
+                    
+                    logger.info(f"Processed {rows_processed:,}/{total_rows:,} rows ({rows_processed/total_rows*100:.1f}%)")
+                    
+                    # Write to file when we have enough rows
+                    if rows_in_batch >= ROWS_PER_FILE:
+                        # Concatenate all DataFrames in the batch
+                        t4 = time.time()
+                        combined_df = pd.concat(batch_dfs, ignore_index=True)
+                        t5 = time.time()
+                        logger.info(f"DataFrame concat took {t5-t4:.2f} seconds")
+                        
+                        # Write to parquet
+                        t6 = time.time()
+                        file_path = OUTPUT_DIR / f"threads-part-{file_idx:05d}.parquet"
+                        table = pa.Table.from_pandas(combined_df, preserve_index=False)
+                        t7 = time.time()
+                        logger.info(f"Arrow Table conversion took {t7-t6:.2f} seconds")
+                        pq.write_table(
+                            table,
+                            file_path,
+                            compression='zstd',
+                            compression_level=5,
+                            use_dictionary=False,
+                            data_page_size=1 << 20
+                        )
+                        t8 = time.time()
+                        logger.info(f"Parquet writing took {t8-t7:.2f} seconds")
+                        
+                        file_size_mb = file_path.stat().st_size / (1024 * 1024)
+                        logger.info(f"Wrote {file_path.name} ({len(combined_df):,} rows, {file_size_mb:.1f} MB)")
+                        
+                        # Reset for next batch
+                        # Explicit memory cleanup
+                        del combined_df
+                        del table
+                        batch_dfs.clear()  # More explicit than batch_dfs = []
+                        batch_dfs = []
+                        rows_in_batch = 0
+                        file_idx += 1
+                        gc.collect()  # Force garbage collection
+                        logger.info("Memory cleanup completed")
+                
+                # Write final partial batch if any remains
+                if batch_dfs:
+                    t4 = time.time()
+                    combined_df = pd.concat(batch_dfs, ignore_index=True)
+                    t5 = time.time()
+                    logger.info(f"DataFrame concat took {t5-t4:.2f} seconds")
+                    file_path = OUTPUT_DIR / f"threads-part-{file_idx:05d}.parquet"
+                    t6 = time.time()
+                    table = pa.Table.from_pandas(combined_df, preserve_index=False)
+                    t7 = time.time()
+                    logger.info(f"Arrow Table conversion took {t7-t6:.2f} seconds")
+                    pq.write_table(
+                        table,
+                        file_path,
+                        compression='zstd',
+                        compression_level=5,
+                        use_dictionary=False,
+                        data_page_size=1 << 20
+                    )
+                    t8 = time.time()
+                    logger.info(f"Parquet writing took {t8-t7:.2f} seconds")
+                    
+                    file_size_mb = file_path.stat().st_size / (1024 * 1024)
+                    logger.info(f"Wrote {file_path.name} ({len(combined_df):,} rows, {file_size_mb:.1f} MB)")
+                    # Explicit memory cleanup
+                    del combined_df
+                    del table
+                    batch_dfs.clear()
+                    gc.collect()
             
             logger.info(f"Export complete! {rows_processed:,} total rows exported.")
             
