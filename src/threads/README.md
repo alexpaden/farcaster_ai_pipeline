@@ -66,7 +66,7 @@ python -m src.threads.workflow --workers 8 --max-batches 100
 python -m src.threads.workflow --batch-size 64 --workers 4
 
 # Larger batch size for higher throughput (monitor for token limits)
-python -m src.threads.workflow --batch-size 500 --workers 2 --max-batches 50
+python -m src.threads.workflow --batch-size 1000 --workers 3 --max-batches 0
 
 # Test run
 python -m src.threads.workflow --test --batch-size 5
