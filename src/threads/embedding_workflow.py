@@ -15,6 +15,8 @@ import random
 # Adjust the import path if your project structure is different
 from src.db.connect import db
 
+# threads_status values: 1=ready/retry, 2=processing, 3=done, 4=api_failed, 5=blank_text
+
 # Configure logging - default to INFO for progress updates
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
