@@ -25,7 +25,7 @@ BEGIN
         -- Capture first timestamp for logging
         SELECT timestamp INTO v_first_timestamp
         FROM unbias.threads 
-        WHERE thread_status = 0 AND spam = 2 
+        WHERE threads_status = 0 AND spam = 2 
         ORDER BY timestamp 
         LIMIT 1;
 
@@ -34,7 +34,7 @@ BEGIN
         batch_threads AS (
             SELECT hash
             FROM unbias.threads
-            WHERE thread_status = 0
+            WHERE threads_status = 0
               AND spam = 2  -- not spam
             ORDER BY timestamp  -- Use the existing index for deterministic ordering
             LIMIT p_batch_size
@@ -56,7 +56,7 @@ BEGIN
                         COUNT(*) AS reply_count,
                         MAX(CASE WHEN c.hash = bt.hash THEN c.text END) AS root_text,
                         MAX(CASE WHEN c.hash = bt.hash THEN c.fid END) AS root_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     WHERE c.root_parent_hash = bt.hash OR c.hash = bt.hash
                 ),
                 -- Get root info with username
@@ -85,7 +85,7 @@ BEGIN
                     -- Root
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
                            0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     WHERE c.hash = bt.hash
                     
                     UNION ALL
@@ -93,7 +93,7 @@ BEGIN
                     -- Children
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
                            p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     JOIN thread_builder p ON c.parent_hash = p.hash
                     WHERE p.depth < 10
                   )
@@ -107,7 +107,7 @@ BEGIN
                   SELECT 
                     r.target_hash AS hash,
                     COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
+                  FROM farcaster.reactions r
                   JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
                   WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
                   GROUP BY r.target_hash
@@ -140,7 +140,7 @@ BEGIN
                     
                     SELECT DISTINCT t.hash
                     FROM thread_with_data t
-                    JOIN nindexer.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
+                    JOIN farcaster.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
                   ),
                   -- Get top 5% most popular posts (minimum 1)
                   popular_extras AS (
@@ -222,7 +222,7 @@ BEGIN
                                            )
                                          ) AS n
                                 ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
                           LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
                           LIMIT 1
                         )
@@ -262,7 +262,7 @@ BEGIN
                                            )
                                          ) AS n
                                 ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
                           LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
                           LIMIT 1
                         )
@@ -322,7 +322,7 @@ BEGIN
                     -- Root
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
                            0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     WHERE c.hash = bt.hash
                     
                     UNION ALL
@@ -330,7 +330,7 @@ BEGIN
                     -- Children
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
                            p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     JOIN thread_builder p ON c.parent_hash = p.hash
                     WHERE p.depth < 10
                   )
@@ -344,7 +344,7 @@ BEGIN
                   SELECT 
                     r.target_hash AS hash,
                     COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
+                  FROM farcaster.reactions r
                   JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
                   WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
                   GROUP BY r.target_hash
@@ -377,7 +377,7 @@ BEGIN
                     
                     SELECT DISTINCT t.hash
                     FROM thread_with_data t
-                    JOIN nindexer.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
+                    JOIN farcaster.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
                   ),
                   -- Get top 5% most popular posts (minimum 1)
                   popular_extras AS (
@@ -459,7 +459,7 @@ BEGIN
                                            )
                                          ) AS n
                                 ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
                           LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
                           LIMIT 1
                         )
@@ -499,7 +499,7 @@ BEGIN
                                            )
                                          ) AS n
                                 ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
+                          LEFT  JOIN farcaster.casts   c ON c.hash = h.embed_hash
                           LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
                           LIMIT 1
                         )
@@ -532,7 +532,7 @@ BEGIN
                             -- For large threads, just get reactions for the root post
                             (
                                 SELECT COUNT(*)
-                                FROM nindexer.reactions r
+                                FROM farcaster.reactions r
                                 JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
                                 WHERE r.target_hash = bt.hash
                             )
@@ -548,7 +548,7 @@ BEGIN
                     -- Root
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
                            0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     WHERE c.hash = bt.hash
                     
                     UNION ALL
@@ -556,7 +556,7 @@ BEGIN
                     -- Children
                     SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
                            p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
+                    FROM farcaster.casts c
                     JOIN thread_builder p ON c.parent_hash = p.hash
                     WHERE p.depth < 10
                   )
@@ -567,7 +567,7 @@ BEGIN
                   SELECT 
                     r.target_hash AS hash,
                     COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
+                  FROM farcaster.reactions r
                   JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
                   WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
                   GROUP BY r.target_hash
@@ -587,8 +587,8 @@ BEGIN
             blob = pt.thread_blob,
             fids = pt.fids_array,
             reactions = pt.total_reactions,
-            blob_timestamp = NOW(),
-            thread_status = 1
+            claimed_at = NOW(),
+            threads_status = 1
         FROM processed_threads pt
         WHERE t.hash = pt.hash;
 

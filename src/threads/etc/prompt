@@ -1,0 +1,49 @@
+Analyze this thread and provide THREE classifications.
+(look PRIMARILY at FIRST POST, use replies (denoted by ↳) for further contextual understanding):
+THREAD TYPE 
+<THREAD TYPE >
+- creation-showcase: Showing something they made (food, music, art, hobbies, artistic expression, personal vs professional, etc)
+- project-update: Announcing updates/milestones for their project (companies, builds, releases)
+- advice-giving: Sharing tips or recommendations
+- question-seeking: Asking for help or information
+- life-update: Sharing personal news
+- opinion-stating: Expressing views or reactions
+- ritual-greeting: GM/GN/social rituals
+- call-to-action: Mint this/Vote/Retweet to win/Join raid
+- market-alert: Price moves/exploits/time-sensitive alpha
+- noise: Spam or unclear
+</THREAD TYPE>
+VALUE EXCHANGE
+<VALUE EXCHANGE> (what participants PRIMARILY GAINED - look beyond surface information):
+- knowledge-transfer: Learned something specific (pure information)
+- social-capital: Built reputation, trust, or connections (information shared to establish credibility/relationships)
+- emotional-energy: Got support/validation/vibes
+- economic-value: Tokens/NFTs/airdrops/bounties
+- none: No clear value exchanged
+</VALUE EXCHANGE>
+INTERACTION PATTERN
+<INTERACTION PATTERN> (how people REPLIED - prioritize the dominant social dynamic):
+- problem-solving: Working together on solutions
+- social-bonding: Jokes/support/relationship building (includes playful exchanges, humor, personal references)
+- show-and-tell: Presenting and getting reactions
+- information-seeking: Q&A or learning (pure information exchange)
+- debate: Arguments/disagreements/controversy
+</INTERACTION PATTERN>
+ANALYSIS GUIDANCE:
+<ANALYSIS GUIDANCE>
+- Look for the PRIMARY purpose, not just surface content
+- Replies are ordered by popularity/engagement - use them to understand the thread's true impact
+- In crypto/web3 contexts, information sharing often serves social capital building
+- Personal references, humor, and self-deprecating responses signal social-bonding
+- Consider what participants actually gained from the exchange beyond literal information
+- When multiple patterns exist, choose the one that drives the most engagement/responses
+</ANALYSIS GUIDANCE>
+Thread:
+<thread-blob>
+(((THREAD TEXT HERE)))
+</thread-blob>
+###
+Return EXACTLY:
+thread_type:<one_of_above>
+value_exchange:<one_of_above>
+interaction_pattern:<one_of_above>

@@ -1,54 +1,37 @@
--- General unprocessed casts index, optimized for timestamp ordering and fid join
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_casts_threads_pending_ts_fid
-  ON farcaster.casts ("timestamp", fid)
-  WHERE threads_status = 0;
+-- 1. Keep - Unprocessed casts index
+CREATE INDEX CONCURRENTLY idx_casts_pending_ts_fid
+    ON nindexer.casts ("timestamp", fid)
+    WHERE threads_status = 0;  -- Or whatever column tracks processing
 
-
--- Tiny index (≈500 k rows) to probe the label table
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_ul_target_spam
+-- 2. Keep - User spam labels lookup
+CREATE INDEX CONCURRENTLY idx_user_labels_spam_target
     ON farcaster.user_labels (target_fid)
-    WHERE label_type = 'spam';          -- one row per fid
+    WHERE label_type = 'spam';
 
-
--- Index for fast feed retrieval of NOT-SPAM rows (spam = 2)
--- ORDER BY timestamp ASC/DESC works (Postgres can scan both ways)
--- Add INCLUDE (...) later if you need index-only scans with more columns
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_ts_spam2
-    ON unbias.threads ("timestamp")
+-- 3. Keep - Feed retrieval for non-spam threads
+CREATE INDEX CONCURRENTLY idx_threads_nonspam_timestamp
+    ON unbias.threads ("timestamp" DESC)
     WHERE spam = 2;
 
+-- 4. Keep - Critical batch processing for unprocessed non-spam threads
+CREATE INDEX CONCURRENTLY idx_threads_unprocessed_nonspam
+    ON unbias.threads (thread_status, spam, "timestamp")
+    WHERE thread_status = 0 AND spam = 2;
 
--- Composite index for batch processing selection
--- This is the most critical index for the process_thread_batches procedure
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_batch_processing
-    ON unbias.threads (threads_status, spam, "timestamp")
-    WHERE threads_status = 0 AND spam = 2;
-
--- Index on author_fid for spam label sync and potential filtering
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_author_fid
+-- 5. Keep - Author FID lookups (removed duplicate)
+CREATE INDEX CONCURRENTLY idx_threads_author
     ON unbias.threads (author_fid);
 
--- Index on claimed_at for monitoring/debugging stuck threads
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_claimed_at
-    ON unbias.threads (claimed_at)
-    WHERE threads_status = 1;  -- Only for claimed threads
-
--- Index on reactions for potential sorting/filtering by popularity
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_reactions
+-- 6. Keep - Popularity-based queries
+CREATE INDEX CONCURRENTLY idx_threads_nonspam_reactions
     ON unbias.threads (reactions DESC)
-    WHERE spam = 2;  -- Only for non-spam threads
+    WHERE spam = 2;
 
--- Partial index for processed threads that might be queried
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_processed
-    ON unbias.threads ("timestamp" DESC)
-    WHERE threads_status = 1 AND spam = 2;
+-- 7. Keep - Multi-status queries with spam filter
+CREATE INDEX CONCURRENTLY idx_threads_nonspam_status_timestamp
+    ON unbias.threads (thread_status, "timestamp" DESC)
+    WHERE spam = 2;
 
--- Index for threads currently being processed by embedding workers (status = 2)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_embedding_claimed
-    ON unbias.threads ("timestamp")
-    WHERE threads_status = 2;
-
--- Index for threads with completed embeddings (status = 3)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_threads_embedding_complete
-    ON unbias.threads ("timestamp" DESC)
-    WHERE threads_status = 3 and spam = 2;
+-- 8. Keep - FID array searches
+CREATE INDEX CONCURRENTLY idx_threads_fids_array
+    ON unbias.threads USING GIN (fids);

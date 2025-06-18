@@ -1,4 +1,4 @@
-CREATE OR REPLACE PROCEDURE nindexer.process_casts(
+CREATE OR REPLACE PROCEDURE farcaster.process_casts(
     p_batch_size   int  DEFAULT 100000,
     p_max_batches  int  DEFAULT NULL          -- NULL = run to completion
 )
@@ -35,7 +35,7 @@ BEGIN
         -- ONE statement does everything and returns the update count
         ------------------------------------------------------------------
         WITH upd AS (
-            UPDATE nindexer.casts c
+            UPDATE farcaster.casts c
                SET threads_status = CASE
                                         WHEN c.hash = c.root_parent_hash
                                         THEN 2      -- root
@@ -43,7 +43,7 @@ BEGIN
                                     END
              WHERE ctid IN (
                    SELECT ctid
-                   FROM   nindexer.casts
+                   FROM   farcaster.casts
                    WHERE  threads_status = 0
                      AND  "timestamp" < clock_timestamp() - INTERVAL '6 hours'
                    ORDER  BY "timestamp"
@@ -54,8 +54,9 @@ BEGIN
                        (c.hash = c.root_parent_hash) AS is_root
         ),
         ins AS (
-            INSERT INTO unbias.threads (hash, author_fid, "timestamp")
-            SELECT hash, fid, "timestamp"
+            INSERT INTO unbias.threads (hash, author_fid, "timestamp",
+                                        threads_status, claimed_at)
+            SELECT hash, fid, "timestamp", 0, NULL
             FROM   upd
             WHERE  is_root
             ON CONFLICT DO NOTHING
@@ -65,7 +66,7 @@ BEGIN
 
         v_elapsed := round(EXTRACT(epoch FROM clock_timestamp() - v_start), 2);
 
-        RAISE NOTICE 'Batch % → % rows  (%.2f s)',
+        RAISE NOTICE 'Batch % → % rows  (%.2f s)',
                      v_batch, v_updated, v_elapsed;
 
         COMMIT;
