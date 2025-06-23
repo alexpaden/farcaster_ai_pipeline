@@ -24,7 +24,8 @@ BEGIN
         thread_type VARCHAR(100) NULL,
         value_exchange VARCHAR(100) NULL,
         interaction_pattern VARCHAR(100) NULL,
-        keywords_array VARCHAR(100)[] NULL
+        keywords_array VARCHAR(100)[] NULL,
+        tokens INT NULL
     );
 
   END IF;

@@ -37,8 +37,8 @@ BEGIN
         WITH upd AS (
             UPDATE nindexer.casts c
                SET threads_status = CASE
-                                        WHEN c.hash = c.root_parent_hash
-                                        THEN 2      -- root
+                                        WHEN c.hash = c.root_parent_hash AND c.parent_hash IS NULL
+                                        THEN 2      -- root (must have no parent)
                                         ELSE 1      -- reply
                                     END
              WHERE ctid IN (
@@ -51,7 +51,7 @@ BEGIN
                    LIMIT  p_batch_size
              )
              RETURNING c.hash, c.fid, c."timestamp",
-                       (c.hash = c.root_parent_hash) AS is_root
+                       (c.hash = c.root_parent_hash AND c.parent_hash IS NULL) AS is_root
         ),
         ins AS (
             INSERT INTO unbias.threads (hash, author_fid, "timestamp")

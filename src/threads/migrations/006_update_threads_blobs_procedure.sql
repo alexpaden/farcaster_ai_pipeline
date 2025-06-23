@@ -30,6 +30,12 @@ BEGIN
         LIMIT 1;
 
         WITH 
+        -- Configuration for minimum reply length (using 20 as default from single_thread_blob_query)
+        config AS (
+            SELECT 20 AS min_reply_length,
+                   20 AS min_root_post_length  -- Minimum length for root post after hydration
+        ),
+        
         -- Get batch of unprocessed threads
         batch_threads AS (
             SELECT hash
@@ -41,16 +47,19 @@ BEGIN
             FOR UPDATE SKIP LOCKED
         ),
         
-        -- Process all threads in the batch
+        -- Process all threads in the batch using new logic from single_thread_blob_query
         processed_threads AS (
             SELECT 
                 bt.hash,
                 thread_data.thread_blob,
                 thread_data.fids_array,
-                thread_data.total_reactions
+                thread_data.total_reactions,
+                thread_data.root_post_hydrated,  -- For length checking
+                thread_data.token_count  -- ADD: Token count for all threads
             FROM batch_threads bt
+            CROSS JOIN config
             CROSS JOIN LATERAL (
-                -- First, check thread size
+                -- Check thread size first
                 WITH thread_size_check AS (
                     SELECT 
                         COUNT(*) AS reply_count,
@@ -74,510 +83,465 @@ BEGIN
                             -- For large threads, just return the original post with a note
                             CONCAT('@', ri.root_username, ': ', ri.root_text, E'\n\n(thread too large: ', ri.reply_count, ' replies)')
                         ELSE
-                            -- For normal threads, use the existing complex logic
-                            (
-                WITH
-                -------------------------------------------------------------------------------
-                -- 1) First, get all casts in the thread
-                -------------------------------------------------------------------------------
-                all_thread_casts AS (
-                  WITH RECURSIVE thread_builder AS (
-                    -- Root
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
-                           0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
-                    WHERE c.hash = bt.hash
-                    
-                    UNION ALL
-                    
-                    -- Children
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
-                           p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
-                    JOIN thread_builder p ON c.parent_hash = p.hash
-                    WHERE p.depth < 10
-                  )
-                  SELECT * FROM thread_builder
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 2) Pre-calculate reaction counts for all thread casts
-                -------------------------------------------------------------------------------
-                thread_reactions AS (
-                  SELECT 
-                    r.target_hash AS hash,
-                    COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
-                  JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
-                  WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
-                  GROUP BY r.target_hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 3) Build thread with all data including reaction counts
-                -------------------------------------------------------------------------------
-                thread_with_data AS (
-                  SELECT 
-                    atc.*,
-                    p.username,
-                    COALESCE(tr.reaction_count, 0) AS reaction_count
-                  FROM all_thread_casts atc
-                  JOIN nindexer.profiles p ON p.fid = atc.fid
-                  LEFT JOIN thread_reactions tr ON tr.hash = atc.hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 4) Get OP interactions and filter nodes
-                -------------------------------------------------------------------------------
-                filtered_thread AS (
-                  -- Mark nodes that OP interacted with
-                  WITH op_interactions AS (
-                    SELECT DISTINCT t.hash
-                    FROM thread_with_data t
-                    WHERE t.fid = t.op_fid -- OP authored
-                    
-                    UNION
-                    
-                    SELECT DISTINCT t.hash
-                    FROM thread_with_data t
-                    JOIN nindexer.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
-                  ),
-                  -- Get top 5% most popular posts (minimum 1)
-                  popular_extras AS (
-                    SELECT hash
-                    FROM (
-                      SELECT
-                        hash,
-                        reaction_count,
-                        ROW_NUMBER() OVER (ORDER BY reaction_count DESC) AS rn,
-                        COUNT(*) OVER () AS total
-                      FROM thread_with_data
-                      WHERE reaction_count > 0  -- Only consider posts with reactions
-                    ) s
-                    WHERE rn <= GREATEST(2, CEIL(total * 0.05))  -- top 5%, but never 0 rows
-                  ),
-                  -- Get all ancestors of needed nodes using path arrays
-                  all_needed AS (
-                    SELECT DISTINCT ancestor_hash
-                    FROM (
-                      SELECT hash FROM op_interactions
-                      UNION
-                      SELECT hash FROM popular_extras  -- Include popular posts
-                    ) x
-                    JOIN thread_with_data t ON t.hash = x.hash
-                    CROSS JOIN LATERAL UNNEST(t.path) AS ancestor_hash
-                  )
-                  SELECT t.*
-                  FROM thread_with_data t
-                  JOIN all_needed an ON t.hash = an.ancestor_hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 5) Calculate subtree popularity
-                -------------------------------------------------------------------------------
-                with_popularity AS (
-                  SELECT 
-                    ft.*,
-                    -- For each node, find max popularity in its subtree
-                    (
-                      SELECT MAX(descendant.reaction_count)
-                      FROM filtered_thread descendant
-                      WHERE descendant.path @> ARRAY[ft.hash]
-                    ) AS max_subtree_popularity
-                  FROM filtered_thread ft
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 6) Build sorted thread with inline quote parsing
-                -------------------------------------------------------------------------------
-                sorted_thread AS (
-                  WITH RECURSIVE ordered_build AS (
-                    -- Root
-                    SELECT
-                      wp.*,
-                      ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
-                      -- Parse quotes inline using regex to handle malformed JSON
-                      CASE
-                        WHEN wp.embeds::text <> '"[]"' 
-                         AND wp.embeds::text LIKE '%castId%'                 -- fast pre-filter
-                        THEN (
-                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
-                             2. Split to individual numbers
-                             3. int → hex → string_agg → DECODE → bytea  */
-                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                          FROM  LATERAL (
-                                  SELECT DECODE(
-                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
-                                           'hex'
-                                         ) AS embed_hash
-                                  FROM   UNNEST(
-                                           STRING_TO_ARRAY(
-                                             ( REGEXP_MATCH(
-                                                 -- Remove outer quotes if present
-                                                 TRIM(BOTH '"' FROM wp.embeds::TEXT),
-                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
-                                               )
-                                             )[1]                                         -- the capture group
-                                             , ','
-                                           )
-                                         ) AS n
-                                ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
-                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
-                          LIMIT 1
-                        )
-                        ELSE NULL
-                      END AS quote_text
-                    FROM with_popularity wp
-                    WHERE wp.parent_hash IS NULL
-                    
-                    UNION ALL
-                    
-                    -- Children
-                    SELECT
-                      child.*,
-                      parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
-                      CASE
-                        WHEN child.embeds::text <> '"[]"' 
-                         AND child.embeds::text LIKE '%castId%'                 -- fast pre-filter
-                        THEN (
-                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
-                             2. Split to individual numbers
-                             3. int → hex → string_agg → DECODE → bytea  */
-                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                          FROM  LATERAL (
-                                  SELECT DECODE(
-                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
-                                           'hex'
-                                         ) AS embed_hash
-                                  FROM   UNNEST(
-                                           STRING_TO_ARRAY(
-                                             ( REGEXP_MATCH(
-                                                 -- Remove outer quotes if present
-                                                 TRIM(BOTH '"' FROM child.embeds::TEXT),
-                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
-                                               )
-                                             )[1]                                         -- the capture group
-                                             , ','
-                                           )
-                                         ) AS n
-                                ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
-                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
-                          LIMIT 1
-                        )
-                        ELSE NULL
-                      END
-                    FROM with_popularity child
-                    JOIN ordered_build parent ON child.parent_hash = parent.hash
-                  )
-                  SELECT * FROM ordered_build
-                )
-
-                -------------------------------------------------------------------------------
-                -- 7) Final output for this thread
-                -------------------------------------------------------------------------------
-                SELECT
-                  -- Thread text
-                  STRING_AGG(
-                    CONCAT(
-                      REPEAT('↳', st.depth),
-                      '@', st.username,
-                      ': ',
-                      CASE 
-                        WHEN st.quote_text IS NOT NULL THEN
-                          -- Try to replace URL first, if no replacement happens, append quote at end
-                          CASE
-                            WHEN st.text ~ 'https:\/\/warpcast\.com\/[^ ]+\/0x[0-9A-Fa-f]{8,}' THEN
-                              -- URL exists, replace it
-                              REGEXP_REPLACE(st.text, 'https:\/\/warpcast\.com\/[^ ]+\/0x[0-9A-Fa-f]{8,}', st.quote_text, 'g')
-                            ELSE
-                              -- No URL, append quote at end
-                              CONCAT(st.text, ' ', st.quote_text)
-                          END
-                        ELSE st.text
-                      END
-                    ),
-                    E'\n'
-                    ORDER BY st.sort_path
-                  ) AS thread_blob
-                FROM sorted_thread st
-                            )
+                            -- For normal threads, use the new complex logic
+                            thread_result.thread_blob
                     END AS thread_blob,
                     
-                    -- FIDs array
                     CASE 
                         WHEN ri.reply_count > 50000 THEN
-                            -- For large threads, just return the root fid
                             ARRAY[ri.root_fid]
                         ELSE
-                            -- For normal threads, get all FIDs ordered by popularity
-                            (
-                                WITH
-                -------------------------------------------------------------------------------
-                -- 1) First, get all casts in the thread
-                -------------------------------------------------------------------------------
-                all_thread_casts AS (
-                  WITH RECURSIVE thread_builder AS (
-                    -- Root
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
-                           0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
-                    WHERE c.hash = bt.hash
-                    
-                    UNION ALL
-                    
-                    -- Children
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
-                           p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
-                    JOIN thread_builder p ON c.parent_hash = p.hash
-                    WHERE p.depth < 10
-                  )
-                  SELECT * FROM thread_builder
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 2) Pre-calculate reaction counts for all thread casts
-                -------------------------------------------------------------------------------
-                thread_reactions AS (
-                  SELECT 
-                    r.target_hash AS hash,
-                    COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
-                  JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
-                  WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
-                  GROUP BY r.target_hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 3) Build thread with all data including reaction counts
-                -------------------------------------------------------------------------------
-                thread_with_data AS (
-                  SELECT 
-                    atc.*,
-                    p.username,
-                    COALESCE(tr.reaction_count, 0) AS reaction_count
-                  FROM all_thread_casts atc
-                  JOIN nindexer.profiles p ON p.fid = atc.fid
-                  LEFT JOIN thread_reactions tr ON tr.hash = atc.hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 4) Get OP interactions and filter nodes
-                -------------------------------------------------------------------------------
-                filtered_thread AS (
-                  -- Mark nodes that OP interacted with
-                  WITH op_interactions AS (
-                    SELECT DISTINCT t.hash
-                    FROM thread_with_data t
-                    WHERE t.fid = t.op_fid -- OP authored
-                    
-                    UNION
-                    
-                    SELECT DISTINCT t.hash
-                    FROM thread_with_data t
-                    JOIN nindexer.reactions r ON r.target_hash = t.hash AND r.fid = t.op_fid
-                  ),
-                  -- Get top 5% most popular posts (minimum 1)
-                  popular_extras AS (
-                    SELECT hash
-                    FROM (
-                      SELECT
-                        hash,
-                        reaction_count,
-                        ROW_NUMBER() OVER (ORDER BY reaction_count DESC) AS rn,
-                        COUNT(*) OVER () AS total
-                      FROM thread_with_data
-                      WHERE reaction_count > 0  -- Only consider posts with reactions
-                    ) s
-                    WHERE rn <= GREATEST(1, CEIL(total * 0.05))  -- top 5%, but never 0 rows
-                  ),
-                  -- Get all ancestors of needed nodes using path arrays
-                  all_needed AS (
-                    SELECT DISTINCT ancestor_hash
-                    FROM (
-                      SELECT hash FROM op_interactions
-                      UNION
-                      SELECT hash FROM popular_extras  -- Include popular posts
-                    ) x
-                    JOIN thread_with_data t ON t.hash = x.hash
-                    CROSS JOIN LATERAL UNNEST(t.path) AS ancestor_hash
-                  )
-                  SELECT t.*
-                  FROM thread_with_data t
-                  JOIN all_needed an ON t.hash = an.ancestor_hash
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 5) Calculate subtree popularity
-                -------------------------------------------------------------------------------
-                with_popularity AS (
-                  SELECT 
-                    ft.*,
-                    -- For each node, find max popularity in its subtree
-                    (
-                      SELECT MAX(descendant.reaction_count)
-                      FROM filtered_thread descendant
-                      WHERE descendant.path @> ARRAY[ft.hash]
-                    ) AS max_subtree_popularity
-                  FROM filtered_thread ft
-                ),
-
-                -------------------------------------------------------------------------------
-                -- 6) Build sorted thread with inline quote parsing
-                -------------------------------------------------------------------------------
-                sorted_thread AS (
-                  WITH RECURSIVE ordered_build AS (
-                    -- Root
-                    SELECT
-                      wp.*,
-                      ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
-                      -- Parse quotes inline using regex to handle malformed JSON
-                      CASE
-                        WHEN wp.embeds::text <> '"[]"' 
-                         AND wp.embeds::text LIKE '%castId%'                 -- fast pre-filter
-                        THEN (
-                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
-                             2. Split to individual numbers
-                             3. int → hex → string_agg → DECODE → bytea  */
-                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                          FROM  LATERAL (
-                                  SELECT DECODE(
-                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
-                                           'hex'
-                                         ) AS embed_hash
-                                  FROM   UNNEST(
-                                           STRING_TO_ARRAY(
-                                             ( REGEXP_MATCH(
-                                                 -- Remove outer quotes if present
-                                                 TRIM(BOTH '"' FROM wp.embeds::TEXT),
-                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
-                                               )
-                                             )[1]                                         -- the capture group
-                                             , ','
-                                           )
-                                         ) AS n
-                                ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
-                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
-                          LIMIT 1
-                        )
-                        ELSE NULL
-                      END AS quote_text
-                    FROM with_popularity wp
-                    WHERE wp.parent_hash IS NULL
-                    
-                    UNION ALL
-                    
-                    -- Children
-                    SELECT
-                      child.*,
-                      parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
-                      CASE
-                        WHEN child.embeds::text <> '"[]"' 
-                         AND child.embeds::text LIKE '%castId%'                 -- fast pre-filter
-                        THEN (
-                          /* 1. Pull the first "…'hash': {'data': [ … ]}" numeric list with a regex
-                             2. Split to individual numbers
-                             3. int → hex → string_agg → DECODE → bytea  */
-                          SELECT CONCAT('QUOTE:["', c.text, '" - @', p.username, ']')
-                          FROM  LATERAL (
-                                  SELECT DECODE(
-                                           STRING_AGG(LPAD(TO_HEX(TRIM(n)::INT), 2, '0'), ''),
-                                           'hex'
-                                         ) AS embed_hash
-                                  FROM   UNNEST(
-                                           STRING_TO_ARRAY(
-                                             ( REGEXP_MATCH(
-                                                 -- Remove outer quotes if present
-                                                 TRIM(BOTH '"' FROM child.embeds::TEXT),
-                                                 $re$'hash'\s*:\s*\{'data'\s*:\s*\[([0-9,\s]+)\]$re$
-                                               )
-                                             )[1]                                         -- the capture group
-                                             , ','
-                                           )
-                                         ) AS n
-                                ) h
-                          LEFT  JOIN nindexer.casts   c ON c.hash = h.embed_hash
-                          LEFT  JOIN nindexer.profiles p ON p.fid  = c.fid
-                          LIMIT 1
-                        )
-                        ELSE NULL
-                      END
-                    FROM with_popularity child
-                    JOIN ordered_build parent ON child.parent_hash = parent.hash
-                  )
-                  SELECT * FROM ordered_build
-                )
-
-                -------------------------------------------------------------------------------
-                -- 7) Get FIDs array ordered by popularity
-                -------------------------------------------------------------------------------
-                SELECT ARRAY_AGG(sub.fid ORDER BY sub.popularity DESC)
-                FROM (
-                  SELECT 
-                    st2.fid,
-                    MAX(st2.reaction_count) AS popularity
-                  FROM sorted_thread st2
-                  WHERE st2.fid IS NOT NULL
-                  GROUP BY st2.fid
-                ) sub
-                            )
+                            thread_result.fids_array
                     END AS fids_array,
                     
-                    -- Total reactions
                     CASE 
                         WHEN ri.reply_count > 50000 THEN
-                            -- For large threads, just get reactions for the root post
                             (
                                 SELECT COUNT(*)
                                 FROM nindexer.reactions r
-                                JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
                                 WHERE r.target_hash = bt.hash
+                                  AND EXISTS (
+                                    SELECT 1 FROM farcaster.user_labels ul 
+                                    WHERE ul.target_fid = r.fid 
+                                    AND ul.label_value::int = 2
+                                    LIMIT 1
+                                  )
                             )
                         ELSE
-                            -- For normal threads, calculate total reactions
-                            (
-                                WITH
-                -------------------------------------------------------------------------------
-                -- Same CTEs as above, but just getting the total reactions
-                -------------------------------------------------------------------------------
-                all_thread_casts AS (
-                  WITH RECURSIVE thread_builder AS (
-                    -- Root
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
-                           0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
-                    FROM nindexer.casts c
-                    WHERE c.hash = bt.hash
+                            thread_result.total_reactions
+                    END AS total_reactions,
                     
-                    UNION ALL
+                    -- Always need root post hydrated text for length check
+                    CASE 
+                        WHEN ri.reply_count > 50000 THEN
+                            ri.root_text  -- For large threads, just use the raw text
+                        ELSE
+                            thread_result.root_post_hydrated
+                    END AS root_post_hydrated,
                     
-                    -- Children
-                    SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
-                           p.depth + 1, p.path || c.hash, p.op_fid
-                    FROM nindexer.casts c
-                    JOIN thread_builder p ON c.parent_hash = p.hash
-                    WHERE p.depth < 10
-                  )
-                  SELECT * FROM thread_builder
-                ),
-
-                thread_reactions AS (
-                  SELECT 
-                    r.target_hash AS hash,
-                    COUNT(*) AS reaction_count
-                  FROM nindexer.reactions r
-                  JOIN farcaster.user_labels ul ON ul.target_fid = r.fid AND ul.label_value::int = 2
-                  WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
-                  GROUP BY r.target_hash
-                )
-
-                SELECT SUM(reaction_count)
-                FROM thread_reactions
+                    -- Token count for all threads
+                    CASE 
+                        WHEN ri.reply_count > 50000 THEN
+                            tiktoken_count('cl100k_base', 
+                                CONCAT('@', ri.root_username, ': ', ri.root_text, E'\n\n(thread too large: ', ri.reply_count, ' replies)')
                             )
-                    END AS total_reactions
+                        ELSE
+                            thread_result.token_count
+                    END AS token_count
+                    
                 FROM root_info ri
+                CROSS JOIN LATERAL (
+                    -- Run the full thread processing logic ONCE
+                    WITH 
+                    -- Get all casts in the thread
+                    all_thread_casts AS MATERIALIZED (
+                      WITH RECURSIVE thread_builder AS (
+                        SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid, 
+                               c.embedded_urls, c.embedded_casts, c.mentions, c.mentions_positions,
+                               0 AS depth, ARRAY[c.hash] AS path, c.fid AS op_fid
+                        FROM nindexer.casts c
+                        WHERE c.hash = bt.hash
+                        
+                        UNION ALL
+                        
+                        SELECT c.hash, c.parent_hash, c.text, c.embeds, c.fid,
+                               c.embedded_urls, c.embedded_casts, c.mentions, c.mentions_positions,
+                               p.depth + 1, p.path || c.hash, p.op_fid
+                        FROM nindexer.casts c
+                        JOIN thread_builder p ON c.parent_hash = p.hash
+                        WHERE p.depth < 10
+                      )
+                      SELECT * FROM thread_builder
+                    ),
+
+                    -- Reaction counts with EXISTS optimization
+                    thread_reactions AS MATERIALIZED (
+                      SELECT 
+                        r.target_hash AS hash,
+                        COUNT(*) AS reaction_count
+                      FROM nindexer.reactions r
+                      WHERE r.target_hash IN (SELECT hash FROM all_thread_casts)
+                        AND EXISTS (
+                          SELECT 1 FROM farcaster.user_labels ul 
+                          WHERE ul.target_fid = r.fid 
+                          AND ul.label_value::int = 2
+                          LIMIT 1
+                        )
+                      GROUP BY r.target_hash
+                    ),
+
+                    -- Build thread with data
+                    thread_with_data AS MATERIALIZED (
+                      SELECT 
+                        atc.*,
+                        p.username,
+                        COALESCE(tr.reaction_count, 0) AS reaction_count
+                      FROM all_thread_casts atc
+                      JOIN nindexer.profiles p ON p.fid = atc.fid
+                      LEFT JOIN thread_reactions tr ON tr.hash = atc.hash
+                    ),
+
+                    -- Filter thread
+                    filtered_thread AS MATERIALIZED (
+                      WITH op_interactions AS (
+                        SELECT DISTINCT t.hash
+                        FROM thread_with_data t
+                        WHERE t.fid = t.op_fid
+                        
+                        UNION
+                        
+                        SELECT DISTINCT t.hash
+                        FROM thread_with_data t
+                        WHERE EXISTS (
+                          SELECT 1 FROM nindexer.reactions r 
+                          WHERE r.target_hash = t.hash AND r.fid = t.op_fid
+                          LIMIT 1
+                        )
+                      ),
+                      popular_extras AS (
+                        SELECT hash
+                        FROM (
+                          SELECT hash, reaction_count,
+                                 ROW_NUMBER() OVER (ORDER BY reaction_count DESC) AS rn,
+                                 COUNT(*) OVER () AS total
+                          FROM thread_with_data
+                          WHERE reaction_count > 0
+                        ) s
+                        WHERE rn <= GREATEST(2, CEIL(total * 0.05))
+                      ),
+                      all_needed AS (
+                        SELECT DISTINCT ancestor_hash
+                        FROM (
+                          SELECT hash FROM op_interactions
+                          UNION
+                          SELECT hash FROM popular_extras
+                        ) x
+                        JOIN thread_with_data t ON t.hash = x.hash
+                        CROSS JOIN LATERAL UNNEST(t.path) AS ancestor_hash
+                      )
+                      SELECT t.*
+                      FROM thread_with_data t
+                      WHERE EXISTS (SELECT 1 FROM all_needed an WHERE t.hash = an.ancestor_hash)
+                    ),
+
+                    -- Calculate subtree popularity
+                    with_popularity AS MATERIALIZED (
+                      SELECT 
+                        ft.*,
+                        (
+                          SELECT MAX(descendant.reaction_count)
+                          FROM filtered_thread descendant
+                          WHERE descendant.path @> ARRAY[ft.hash]
+                        ) AS max_subtree_popularity
+                      FROM filtered_thread ft
+                    ),
+
+                    -------------------------------------------------------------------------------
+                    -- OPTIMIZED FULL QUOTE HYDRATION - From single_thread_blob_query
+                    -------------------------------------------------------------------------------
+
+                    -- Step 1: Pre-collect ALL FIDs we'll need for the entire quote tree
+                    all_quote_fids AS MATERIALIZED (
+                      WITH RECURSIVE quote_scan AS (
+                        -- Start with main thread casts
+                        SELECT 
+                          hash,
+                          fid,
+                          mentions,
+                          embedded_casts,
+                          0 as depth
+                        FROM with_popularity
+                        
+                        UNION ALL
+                        
+                        -- Scan embedded casts recursively
+                        SELECT 
+                          c.hash,
+                          c.fid,
+                          c.mentions,
+                          c.embedded_casts,
+                          qs.depth + 1
+                        FROM quote_scan qs
+                        CROSS JOIN LATERAL UNNEST(qs.embedded_casts) AS ec(hash)
+                        JOIN nindexer.casts c ON c.hash = ec.hash
+                        WHERE qs.depth < 3
+                      )
+                      SELECT DISTINCT fid FROM (
+                        -- All cast authors
+                        SELECT fid FROM quote_scan
+                        UNION
+                        -- All mentioned users
+                        SELECT UNNEST(mentions) as fid 
+                        FROM quote_scan 
+                        WHERE mentions IS NOT NULL AND array_length(mentions, 1) > 0
+                      ) all_fids
+                      WHERE fid IS NOT NULL
+                    ),
+
+                    -- Step 2: Load all needed profiles in one go
+                    quote_profiles AS MATERIALIZED (
+                      SELECT fid, username
+                      FROM nindexer.profiles
+                      WHERE fid IN (SELECT fid FROM all_quote_fids)
+                    ),
+
+                    -- Step 3: Process quotes
+                    quote_rec AS MATERIALIZED (
+                      WITH RECURSIVE quote_builder AS (
+                        SELECT  
+                          wp.hash, 
+                          wp.text,
+                          wp.embedded_urls, 
+                          wp.embedded_casts,
+                          wp.mentions, 
+                          wp.mentions_positions,
+                          wp.fid, 
+                          wp.username,
+                          0 AS quote_level,
+                          ARRAY[wp.hash]::bytea[] AS quote_path
+                        FROM with_popularity wp
+                        
+                        UNION ALL
+                        
+                        SELECT  
+                          c.hash, 
+                          c.text,
+                          c.embedded_urls, 
+                          c.embedded_casts,
+                          c.mentions, 
+                          c.mentions_positions,
+                          c.fid, 
+                          qp.username,
+                          qb.quote_level + 1,
+                          qb.quote_path || c.hash
+                        FROM quote_builder qb
+                        CROSS JOIN LATERAL (
+                          SELECT DISTINCT h.hash
+                          FROM unnest(qb.embedded_casts) AS h(hash)
+                        ) h
+                        JOIN nindexer.casts c ON c.hash = h.hash
+                        JOIN quote_profiles qp ON qp.fid = c.fid
+                        WHERE qb.quote_level < 3
+                          AND array_position(qb.quote_path, c.hash) IS NULL
+                      )
+                      SELECT * FROM quote_builder
+                    ),
+
+                    -- Step 4: Process mentions with pre-loaded profiles
+                    quote_pos AS (
+                      SELECT DISTINCT ON (qr.hash, tag)
+                        qr.hash,
+                        length(
+                          convert_from(
+                            substring(convert_to(qr.text,'utf8')
+                                      FROM 1 FOR qr.mentions_positions[i]),
+                            'utf8')) AS char_pos,
+                        tag
+                      FROM quote_rec qr
+                      CROSS JOIN LATERAL generate_subscripts(qr.mentions,1) AS gs(i)
+                      JOIN quote_profiles qp ON qp.fid = qr.mentions[gs.i]
+                      CROSS JOIN LATERAL (SELECT '@'||qp.username AS tag) t
+                      WHERE qr.mentions IS NOT NULL 
+                        AND array_length(qr.mentions, 1) > 0
+                      ORDER BY qr.hash, tag, char_pos
+                    ),
+
+                    quote_seg AS (
+                      SELECT  
+                        qp.hash,
+                        qp.char_pos,
+                        substr(qr.text,
+                               COALESCE(lag(qp.char_pos) OVER w,0)+1,
+                               qp.char_pos-COALESCE(lag(qp.char_pos) OVER w,0))
+                        || qp.tag AS chunk
+                      FROM quote_pos qp
+                      JOIN quote_rec qr USING (hash)
+                      WINDOW w AS (PARTITION BY qp.hash ORDER BY qp.char_pos)
+                    ),
+
+                    quote_rebuild AS (
+                      SELECT 
+                        hash,
+                        string_agg(chunk,'' ORDER BY char_pos) AS head,
+                        max(char_pos) AS last_char
+                      FROM quote_seg
+                      GROUP BY hash
+                    ),
+
+                    -- Handle missing URLs
+                    quote_missing_urls AS (
+                      SELECT  
+                        qr.hash,
+                        array_agg(DISTINCT url) AS urls
+                      FROM quote_rec qr
+                      CROSS JOIN unnest(qr.embedded_urls) AS u(url)
+                      WHERE position(lower(url) IN lower(qr.text)) = 0
+                        AND qr.embedded_urls IS NOT NULL 
+                        AND array_length(qr.embedded_urls, 1) > 0
+                      GROUP BY qr.hash
+                    ),
+
+                    -- Build core text with mentions and URLs
+                    quote_core AS (
+                      SELECT  
+                        qr.hash,
+                        COALESCE(qrb.head || substr(qr.text,qrb.last_char+1), qr.text) AS body,
+                        COALESCE(
+                          CASE WHEN qmu.urls IS NULL OR array_length(qmu.urls,1)=0
+                               THEN '' ELSE ' '||array_to_string(qmu.urls,' ') END,'') AS tail,
+                        qr.username AS author,
+                        qr.embedded_casts
+                      FROM quote_rec qr
+                      LEFT JOIN quote_rebuild qrb USING (hash)
+                      LEFT JOIN quote_missing_urls qmu USING (hash)
+                    ),
+
+                    -- Build quote tree bottom-up
+                    quote_tree AS (
+                      WITH RECURSIVE quote_tree_builder AS (
+                        -- Leaves (no embedded casts)
+                        SELECT  
+                          qc.hash,
+                          qc.body || qc.tail AS full_text,
+                          qc.author
+                        FROM quote_core qc
+                        WHERE qc.embedded_casts IS NULL
+                           OR array_length(qc.embedded_casts,1)=0
+
+                        UNION ALL
+                        
+                        -- Parents (with embedded casts)
+                        SELECT  
+                          qc.hash,
+                          qc.body
+                          || ' ' || format(
+                                 'QUOTE:["%s" - @%s]',
+                                 qtb.full_text,
+                                 qtb.author)
+                          || qc.tail AS full_text,
+                          qc.author
+                        FROM quote_core qc
+                        CROSS JOIN LATERAL (
+                          SELECT DISTINCT h.hash
+                          FROM unnest(qc.embedded_casts) AS h(hash)
+                        ) h
+                        JOIN quote_tree_builder qtb ON qtb.hash = h.hash
+                      )
+                      SELECT * FROM quote_tree_builder
+                    ),
+
+                    -- Final hydrated text with deduplication, URL removal, and line break normalization
+                    final_quote_text AS MATERIALIZED (
+                      SELECT DISTINCT ON (hash)
+                        hash,
+                        regexp_replace(
+                          regexp_replace(
+                            regexp_replace(full_text,
+                               '(@[A-Za-z0-9._]+)\1+', '\1', 'g'),
+                            'https://(farcaster\.xyz|warpcast\.com)/[^/]+/0x[a-fA-F0-9]+', '', 'g'),
+                          E'[\\n\\r\\t]+', ' ', 'g'
+                        ) AS hydrated_text
+                      FROM quote_tree
+                      ORDER BY hash
+                    ),
+
+                    -- Build sorted thread
+                    sorted_thread AS MATERIALIZED (
+                      WITH RECURSIVE ordered_build AS (
+                        -- Root
+                        SELECT
+                          wp.*,
+                          ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
+                          COALESCE(fqt.hydrated_text, wp.text) AS final_text
+                        FROM with_popularity wp
+                        LEFT JOIN final_quote_text fqt ON fqt.hash = wp.hash
+                        WHERE wp.parent_hash IS NULL
+                        
+                        UNION ALL
+                        
+                        -- Children
+                        SELECT
+                          child.*,
+                          parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
+                          COALESCE(fqt.hydrated_text, child.text)
+                        FROM with_popularity child
+                        JOIN ordered_build parent ON child.parent_hash = parent.hash
+                        LEFT JOIN final_quote_text fqt ON fqt.hash = child.hash
+                      )
+                      SELECT * FROM ordered_build
+                    )
+
+                    -- Final output combining all results
+                    SELECT 
+                        -- 1. THREAD BLOB
+                        (
+                            SELECT STRING_AGG(
+                                CONCAT(
+                                  CASE WHEN st.depth = 0 THEN '' ELSE '~' || st.depth || ': ' END,
+                                  '@', st.username,
+                                  ': ',
+                                  st.final_text
+                                ),
+                                E'\n'
+                                ORDER BY st.sort_path
+                            )
+                            FROM sorted_thread st
+                            WHERE st.depth = 0 OR LENGTH(st.final_text) >= config.min_reply_length
+                        ) AS thread_blob,
+                        
+                        -- 2. FIDS ARRAY
+                        (
+                            SELECT ARRAY_AGG(sub.fid ORDER BY sub.popularity DESC)
+                            FROM (
+                              SELECT 
+                                st2.fid,
+                                MAX(st2.reaction_count) AS popularity
+                              FROM sorted_thread st2
+                              WHERE st2.fid IS NOT NULL
+                                AND (st2.depth = 0 OR LENGTH(st2.final_text) >= config.min_reply_length)
+                              GROUP BY st2.fid
+                            ) sub
+                        ) AS fids_array,
+                        
+                        -- 3. TOTAL REACTIONS
+                        COALESCE(
+                            (
+                                SELECT SUM(tr.reaction_count) 
+                                FROM thread_reactions tr
+                                JOIN sorted_thread st ON st.hash = tr.hash
+                                WHERE st.depth = 0 OR LENGTH(st.final_text) >= config.min_reply_length
+                            ),
+                            0
+                        ) AS total_reactions,
+                        
+                        -- 4. ROOT POST HYDRATED TEXT (for length checking)
+                        (
+                            SELECT st.final_text
+                            FROM sorted_thread st
+                            WHERE st.depth = 0
+                            LIMIT 1
+                        ) AS root_post_hydrated,
+                        
+                        -- 5. TOKEN COUNT
+                        tiktoken_count('cl100k_base', 
+                            (
+                                SELECT STRING_AGG(
+                                    CONCAT(
+                                      CASE WHEN st.depth = 0 THEN '' ELSE '~' || st.depth || ': ' END,
+                                      '@', st.username,
+                                      ': ',
+                                      st.final_text
+                                    ),
+                                    E'\n'
+                                    ORDER BY st.sort_path
+                                )
+                                FROM sorted_thread st
+                                WHERE st.depth = 0 OR LENGTH(st.final_text) >= config.min_reply_length
+                            )
+                        ) AS token_count
+                    
+                ) AS thread_result
+                WHERE ri.reply_count <= 50000  -- Only run complex logic for normal-sized threads
             ) AS thread_data
         )
         
@@ -587,8 +551,12 @@ BEGIN
             blob = pt.thread_blob,
             fids = pt.fids_array,
             reactions = pt.total_reactions,
+            tokens = pt.token_count,
             blob_timestamp = NOW(),
-            thread_status = 1
+            thread_status = CASE 
+                WHEN LENGTH(pt.root_post_hydrated) < (SELECT min_root_post_length FROM config) THEN 99
+                ELSE 1
+            END
         FROM processed_threads pt
         WHERE t.hash = pt.hash;
 
@@ -625,4 +593,4 @@ BEGIN
         END IF;
     END LOOP;
 END;
-$$; 
+$$;
