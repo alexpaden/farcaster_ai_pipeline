@@ -333,11 +333,30 @@ BEGIN
                         qr.hash,
                         length(
                           convert_from(
-                            substring(convert_to(qr.text,'utf8')
-                                      FROM 1 FOR qr.mentions_positions[i]),
+                            substring(qr_bytes.utf8_bytes
+                                      FROM 1 FOR 
+                                      -- Adjust position if it's a UTF-8 continuation byte (128-191)
+                                      CASE 
+                                        WHEN qr.mentions_positions[i] > 0 
+                                         AND get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]-1) BETWEEN 128 AND 191
+                                        THEN 
+                                          -- Find next valid UTF-8 boundary (skip continuation bytes)
+                                          CASE
+                                            WHEN qr.mentions_positions[i] >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
+                                            WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]) < 128 THEN qr.mentions_positions[i] + 1
+                                            WHEN qr.mentions_positions[i]+1 >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
+                                            WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+1) < 128 THEN qr.mentions_positions[i] + 2
+                                            WHEN qr.mentions_positions[i]+2 >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
+                                            WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+2) < 128 THEN qr.mentions_positions[i] + 3
+                                            ELSE qr.mentions_positions[i] + 4
+                                          END
+                                        ELSE qr.mentions_positions[i]
+                                      END),
                             'utf8')) AS char_pos,
                         tag
                       FROM quote_rec qr
+                      -- Convert text to UTF-8 bytes once per row to avoid repeated conversions
+                      CROSS JOIN LATERAL (SELECT convert_to(qr.text,'utf8') AS utf8_bytes) qr_bytes
                       CROSS JOIN LATERAL generate_subscripts(qr.mentions,1) AS gs(i)
                       JOIN quote_profiles qp ON qp.fid = qr.mentions[gs.i]
                       CROSS JOIN LATERAL (SELECT '@'||qp.username AS tag) t
