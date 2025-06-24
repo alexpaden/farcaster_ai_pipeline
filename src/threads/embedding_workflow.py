@@ -5,8 +5,6 @@ import os
 import argparse
 from typing import List, Tuple, Optional
 import voyageai
-import numpy as np
-from contextlib import asynccontextmanager
 import pgvector.asyncpg
 import time
 import random
@@ -15,7 +13,7 @@ import random
 # Adjust the import path if your project structure is different
 from src.db.connect import db
 
-# threads_status values: 1=ready/retry, 2=processing, 3=done, 4=api_failed, 5=blank_text
+# thread_status values: 1=ready/retry, 2=processing, 3=done (ubinary embeddings), 4=api_failed, 5=blank_text
 
 # Configure logging - default to INFO for progress updates
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -26,14 +24,33 @@ logging.getLogger('voyage').setLevel(logging.WARNING)
 
 # Constants
 DB_COMMAND_TIMEOUT = 300
-VOYAGE_MODEL = "voyage-3.5-lite"
-EMBEDDING_DIM = 512  # Must match database schema (vector(512) and halfvec(512))
+VOYAGE_MODEL = "voyage-3.5-lite"  # Supports ubinary output
+EMBEDDING_DIM = 512  # Must match database schema (bit(512))
 # Voyage API limits: 1,000 texts or 1M tokens per request
 # You can increase up to 1,000 if tracking token counts
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_MAX_BATCHES = 0  # 0 means unlimited - process all available rows
 PROGRESS_LOG_INTERVAL = 10_000  # Log progress every 10k rows
 MAX_CONSECUTIVE_ERRORS = 10  # Kill script after this many consecutive errors
+
+def voyage_ubinary_to_pgvector_bits(packed_ubinary: List[int]) -> str:
+    """Convert Voyage AI's bit-packed ubinary format to pgvector bit string
+    
+    Args:
+        packed_ubinary: List of uint8 values (0-255) from Voyage AI ubinary embeddings
+        
+    Returns:
+        Bit string for pgvector (e.g., '001101...')
+    """
+    bits = []
+    for uint8_val in packed_ubinary:
+        # Unpack 8 bits from each uint8 (MSB first to match PostgreSQL bit ordering)
+        for i in range(7, -1, -1):  # Process bits from MSB to LSB
+            bit = (uint8_val >> i) & 1
+            bits.append(str(bit))
+    
+    # Ensure we have exactly 512 bits
+    return ''.join(bits[:EMBEDDING_DIM])
 
 class ProgressTracker:
     """Shared progress tracker for all workers"""
@@ -97,14 +114,14 @@ class ThreadEmbeddingWorker:
                         WITH batch AS (
                             SELECT hash, blob
                             FROM   unbias.threads
-                            WHERE  threads_status = 1
+                            WHERE  thread_status = 1
                               AND  spam = 2
                             ORDER  BY timestamp DESC
                             LIMIT  $1
                             FOR UPDATE SKIP LOCKED
                         )
                         UPDATE unbias.threads t
-                        SET    threads_status = 2
+                        SET    thread_status = 2
                         FROM   batch b
                         WHERE  t.hash = b.hash
                         RETURNING b.hash, b.blob;
@@ -121,11 +138,11 @@ class ThreadEmbeddingWorker:
                 raise SystemExit("Too many consecutive database errors")
             raise
     
-    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, np.ndarray]], List[bytes], List[bytes], List[bytes]]:
+    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, str]], List[bytes], List[bytes], List[bytes]]:
         """Process a batch of texts and generate embeddings
         
         Returns:
-            Tuple of (successful, failed, blank, retry) where successful has (hash, embedding) pairs,
+            Tuple of (successful, failed, blank, retry) where successful has (hash, bit_string) pairs,
             failed are hashes that failed API permanently, blank are hashes with empty text, retry are hashes to be reset to status 1
         """
         if not batch:
@@ -161,14 +178,23 @@ class ThreadEmbeddingWorker:
                     processed_texts, 
                     model=VOYAGE_MODEL,
                     input_type="document",
-                    output_dimension=512
+                    output_dimension=512,
+                    output_dtype="ubinary"  # Use ubinary embeddings (uint8, cleaner than binary int8)
                 )
-                embeddings = [np.array(emb, dtype=np.float32) for emb in result.embeddings]
-                if embeddings and self.batches_processed == 0:
-                    actual_dim = len(embeddings[0])
+                
+                # Convert ubinary embeddings to pgvector bit strings
+                bit_strings = []
+                for ubinary_embedding in result.embeddings:
+                    bit_string = voyage_ubinary_to_pgvector_bits(ubinary_embedding)
+                    bit_strings.append(bit_string)
+                
+                # Validate dimensions on first batch
+                if bit_strings and self.batches_processed == 0:
+                    actual_dim = len(bit_strings[0])
                     if actual_dim != EMBEDDING_DIM:
-                        self.logger.error(f"Dimension mismatch! voyage-3.5-lite returned {actual_dim}D embeddings, but database expects {EMBEDDING_DIM}D")
-                successful = [(hashes[valid_indices[i]], embeddings[i]) for i in range(len(embeddings))]
+                        self.logger.error(f"Dimension mismatch! {VOYAGE_MODEL} returned {actual_dim}D ubinary embeddings, but database expects {EMBEDDING_DIM}D")
+                
+                successful = [(hashes[valid_indices[i]], bit_strings[i]) for i in range(len(bit_strings))]
                 failed = []
                 self.consecutive_errors = 0
                 return successful, failed, blank_hashes, []
@@ -193,38 +219,32 @@ class ThreadEmbeddingWorker:
                         return [], hashes, blank_hashes, []
         return [], hashes, blank_hashes, []
     
-    async def update_embeddings(self, successful: List[Tuple[bytes, np.ndarray]]):
-        """Update database with successful embeddings
+    async def update_embeddings(self, successful: List[Tuple[bytes, str]]):
+        """Update database with successful ubinary embeddings
         
         Args:
-            successful: List of (hash, embedding) tuples where hash is bytes
+            successful: List of (hash, bit_string) tuples where hash is bytes and bit_string is str
         """
         if not successful:
             return
         
         try:
             async with db.pool.acquire() as conn:
-                # Register pgvector for this connection
-                await pgvector.asyncpg.register_vector(conn)
-                
                 async with conn.transaction():
                     # Prepare data for bulk update
-                    # Pass the embedding twice to avoid parameter reuse issues
                     update_data = []
-                    for hash_val, embedding in successful:
-                        # Convert numpy array to list for pgvector
-                        vector_data = embedding.tolist()
-                        # Pass vector_data twice - once for blob_embedding, once for blob_embedding_fp16
-                        update_data.append((vector_data, vector_data, hash_val))
+                    for hash_val, bit_string in successful:
+                        # Convert bit string to bytes for asyncpg
+                        # asyncpg expects bytes for the bit type, not strings
+                        bit_bytes = bit_string.encode('ascii')
+                        update_data.append((bit_bytes, hash_val))
                     
-                    # Bulk update using executemany
-                    # This sends all updates in a single round trip to the database
+                    # Bulk update using executemany - store ubinary-derived embeddings
                     await conn.executemany("""
                         UPDATE unbias.threads
-                        SET blob_embedding = $1,
-                            blob_embedding_fp16 = $2,
-                            threads_status = 3
-                        WHERE hash = $3;
+                        SET blob_embedding_binary = $1::bit(512),
+                            thread_status = 3
+                        WHERE hash = $2;
                     """, update_data)
                     
                     # Update progress tracker
@@ -250,7 +270,7 @@ class ThreadEmbeddingWorker:
                 async with conn.transaction():
                     await conn.execute(f"""
                         UPDATE unbias.threads
-                        SET    threads_status = {status}
+                        SET    thread_status = {status}
                         WHERE  hash = ANY($1);
                     """, failed_hashes)
                     if len(failed_hashes) > 100:
@@ -316,7 +336,7 @@ class ThreadEmbeddingWorker:
 async def main(args):
     """Main entry point for the threads embedding pipeline"""
     # Initial startup message at INFO level
-    logger.info("Starting threads embedding pipeline...")
+    logger.info("Starting threads ubinary embedding pipeline...")
     start_time = time.time()
     
     # Check for VoyageAI API key
@@ -329,6 +349,7 @@ async def main(args):
         await db.initialize_pool(command_timeout=DB_COMMAND_TIMEOUT)
         
         # Register pgvector extension with all connections in the pool
+        # This is needed for HNSW indexes and Hamming distance operations on binary embeddings
         async def setup_pgvector(connection):
             await pgvector.asyncpg.register_vector(connection)
         
@@ -409,7 +430,7 @@ async def main(args):
         total_duration = time.time() - start_time
         total_rows = progress_tracker.total_rows
         rate = total_rows / total_duration if total_duration > 0 else 0
-        logger.info(f"Threads embedding pipeline completed: {total_rows:,} rows in {total_duration:.1f}s ({rate:.0f} rows/sec)")
+        logger.info(f"Threads ubinary embedding pipeline completed: {total_rows:,} rows in {total_duration:.1f}s ({rate:.0f} rows/sec)")
         
     except Exception as e:
         logger.error(f"An error occurred in the main workflow: {e}", exc_info=True)

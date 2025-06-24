@@ -235,19 +235,25 @@ quote_pos AS (
       convert_from(
         substring(qr_bytes.utf8_bytes
                   FROM 1 FOR 
-                  -- Adjust position if it's a UTF-8 continuation byte (128-191)
+                  -- Adjust position if it points to a UTF-8 continuation byte
                   CASE 
-                    WHEN qr.mentions_positions[i] > 0 
-                     AND get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]-1) BETWEEN 128 AND 191
+                    WHEN qr.mentions_positions[i] = 0 THEN qr.mentions_positions[i]
+                    WHEN qr.mentions_positions[i] >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
+                    -- Check if current position is a continuation byte (10xxxxxx = 128-191)
+                    WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]) BETWEEN 128 AND 191
                     THEN 
-                      -- Find next valid UTF-8 boundary (skip continuation bytes)
+                      -- Find next valid UTF-8 boundary (skip to next character start)
                       CASE
-                        WHEN qr.mentions_positions[i] >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
-                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]) < 128 THEN qr.mentions_positions[i] + 1
                         WHEN qr.mentions_positions[i]+1 >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
-                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+1) < 128 THEN qr.mentions_positions[i] + 2
+                        -- Next byte is ASCII (< 128) or multi-byte start (>= 192)
+                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+1) < 128 
+                          OR get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+1) >= 192 THEN qr.mentions_positions[i] + 1
                         WHEN qr.mentions_positions[i]+2 >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
-                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+2) < 128 THEN qr.mentions_positions[i] + 3
+                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+2) < 128 
+                          OR get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+2) >= 192 THEN qr.mentions_positions[i] + 2
+                        WHEN qr.mentions_positions[i]+3 >= octet_length(qr_bytes.utf8_bytes) THEN octet_length(qr_bytes.utf8_bytes)
+                        WHEN get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+3) < 128 
+                          OR get_byte(qr_bytes.utf8_bytes, qr.mentions_positions[i]+3) >= 192 THEN qr.mentions_positions[i] + 3
                         ELSE qr.mentions_positions[i] + 4
                       END
                     ELSE qr.mentions_positions[i]

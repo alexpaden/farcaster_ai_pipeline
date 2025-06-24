@@ -19,13 +19,14 @@ BEGIN
         blob_timestamp TIMESTAMP WITH TIME ZONE NULL, -- Formerly claimed_at
         blob_embedding VECTOR(512) NULL,
         blob_embedding_fp16 HALFVEC(512) NULL,
+        blob_embedding_binary bit(512) NULL,
         classifier_status SMALLINT DEFAULT 0,
         classifier_timestamp TIMESTAMP WITH TIME ZONE NULL,
         thread_type VARCHAR(100) NULL,
         value_exchange VARCHAR(100) NULL,
         interaction_pattern VARCHAR(100) NULL,
         keywords_array VARCHAR(100)[] NULL,
-        tokens INT NULL
+        tokens INT NULL       
     );
 
   END IF;
