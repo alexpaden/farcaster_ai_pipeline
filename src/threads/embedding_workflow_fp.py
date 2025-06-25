@@ -13,7 +13,11 @@ import random
 # Adjust the import path if your project structure is different
 from src.db.connect import db
 
-# thread_status values: 1=ready/retry, 2=processing, 3=done (ubinary embeddings), 19=error (any type)
+# Status codes for thread_status:
+#   3 = has_binary_embeddings (input, ready for float32)
+#   4 = processing_fp32 (claimed by worker)
+#   5 = done_fp32 (embedding complete)
+#   19 = error (any type)
 
 # Configure logging - default to INFO for progress updates
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,33 +28,14 @@ logging.getLogger('voyage').setLevel(logging.WARNING)
 
 # Constants
 DB_COMMAND_TIMEOUT = 300
-VOYAGE_MODEL = "voyage-3.5-lite"  # Supports ubinary output
-EMBEDDING_DIM = 512  # Must match database schema (bit(512))
+VOYAGE_MODEL = "voyage-3.5-lite"  # Supports float output
+EMBEDDING_DIM = 512  # Must match database schema
 # Voyage API limits: 1,000 texts or 1M tokens per request
 # You can increase up to 1,000 if tracking token counts
 DEFAULT_BATCH_SIZE = 128
 DEFAULT_MAX_BATCHES = 0  # 0 means unlimited - process all available rows
 PROGRESS_LOG_INTERVAL = 10_000  # Log progress every 10k rows
 MAX_CONSECUTIVE_ERRORS = 10  # Kill script after this many consecutive errors
-
-def voyage_ubinary_to_pgvector_bits(packed_ubinary: List[int]) -> str:
-    """Convert Voyage AI's bit-packed ubinary format to pgvector bit string
-    
-    Args:
-        packed_ubinary: List of uint8 values (0-255) from Voyage AI ubinary embeddings
-        
-    Returns:
-        Bit string for pgvector (e.g., '001101...')
-    """
-    bits = []
-    for uint8_val in packed_ubinary:
-        # Unpack 8 bits from each uint8 (MSB first to match PostgreSQL bit ordering)
-        for i in range(7, -1, -1):  # Process bits from MSB to LSB
-            bit = (uint8_val >> i) & 1
-            bits.append(str(bit))
-    
-    # Ensure we have exactly 512 bits
-    return ''.join(bits[:EMBEDDING_DIM])
 
 class ProgressTracker:
     """Shared progress tracker for all workers"""
@@ -114,14 +99,14 @@ class ThreadEmbeddingWorker:
                         WITH batch AS (
                             SELECT hash, blob
                             FROM   unbias.threads
-                            WHERE  thread_status = 1
+                            WHERE  thread_status = 3  -- Pick up rows that have binary embeddings
                               AND  spam = 2
                             ORDER  BY timestamp DESC
                             LIMIT  $1
                             FOR UPDATE SKIP LOCKED
                         )
                         UPDATE unbias.threads t
-                        SET    thread_status = 2
+                        SET    thread_status = 4
                         FROM   batch b
                         WHERE  t.hash = b.hash
                         RETURNING b.hash, b.blob;
@@ -138,12 +123,12 @@ class ThreadEmbeddingWorker:
                 raise SystemExit("Too many consecutive database errors")
             raise
     
-    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, str]], List[bytes], List[bytes], List[bytes]]:
+    async def process_batch(self, batch: List[Tuple[bytes, str]]) -> Tuple[List[Tuple[bytes, List[float]]], List[bytes], List[bytes], List[bytes]]:
         """Process a batch of texts and generate embeddings
         
         Returns:
-            Tuple of (successful, failed, blank, retry) where successful has (hash, bit_string) pairs,
-            failed are hashes that failed API permanently, blank are hashes with empty text, retry are hashes to be reset to status 1
+            Tuple of (successful, failed, blank, retry) where successful has (hash, embedding) pairs,
+            failed are hashes that failed API permanently, blank are hashes with empty text, retry are hashes to be reset to status 3
         """
         if not batch:
             return [], [], [], []
@@ -179,22 +164,19 @@ class ThreadEmbeddingWorker:
                     model=VOYAGE_MODEL,
                     input_type="document",
                     output_dimension=512,
-                    output_dtype="ubinary"  # Use ubinary embeddings (uint8, cleaner than binary int8)
+                    output_dtype="float"  # Use float32 embeddings (default)
                 )
                 
-                # Convert ubinary embeddings to pgvector bit strings
-                bit_strings = []
-                for ubinary_embedding in result.embeddings:
-                    bit_string = voyage_ubinary_to_pgvector_bits(ubinary_embedding)
-                    bit_strings.append(bit_string)
+                # Embeddings are already float32 lists
+                embeddings = result.embeddings
                 
                 # Validate dimensions on first batch
-                if bit_strings and self.batches_processed == 0:
-                    actual_dim = len(bit_strings[0])
+                if embeddings and self.batches_processed == 0:
+                    actual_dim = len(embeddings[0])
                     if actual_dim != EMBEDDING_DIM:
-                        self.logger.error(f"Dimension mismatch! {VOYAGE_MODEL} returned {actual_dim}D ubinary embeddings, but database expects {EMBEDDING_DIM}D")
+                        self.logger.error(f"Dimension mismatch! {VOYAGE_MODEL} returned {actual_dim}D embeddings, but database expects {EMBEDDING_DIM}D")
                 
-                successful = [(hashes[valid_indices[i]], bit_strings[i]) for i in range(len(bit_strings))]
+                successful = [(hashes[valid_indices[i]], embeddings[i]) for i in range(len(embeddings))]
                 failed = []
                 self.consecutive_errors = 0
                 return successful, failed, blank_hashes, []
@@ -212,18 +194,18 @@ class ThreadEmbeddingWorker:
                         self.logger.error(f"Too many consecutive API errors ({MAX_CONSECUTIVE_ERRORS}), shutting down")
                         raise SystemExit("Too many consecutive API errors")
                     if is_server_overload:
-                        # Mark for retry (status 1)
+                        # Mark for retry (status 3 - keep available for float32)
                         return [], [], blank_hashes, hashes
                     else:
                         # Permanent error
                         return [], hashes, blank_hashes, []
         return [], hashes, blank_hashes, []
     
-    async def update_embeddings(self, successful: List[Tuple[bytes, str]]):
-        """Update database with successful ubinary embeddings
+    async def update_embeddings(self, successful: List[Tuple[bytes, List[float]]]):
+        """Update database with successful float32 embeddings
         
         Args:
-            successful: List of (hash, bit_string) tuples where hash is bytes and bit_string is str
+            successful: List of (hash, embedding) tuples where hash is bytes and embedding is List[float]
         """
         if not successful:
             return
@@ -232,18 +214,14 @@ class ThreadEmbeddingWorker:
             async with db.pool.acquire() as conn:
                 async with conn.transaction():
                     # Prepare data for bulk update
-                    update_data = []
-                    for hash_val, bit_string in successful:
-                        # Convert bit string to bytes for asyncpg
-                        # asyncpg expects bytes for the bit type, not strings
-                        bit_bytes = bit_string.encode('ascii')
-                        update_data.append((bit_bytes, hash_val))
+                    # pgvector expects float[] arrays for vector columns
+                    update_data = [(embedding, hash_val) for hash_val, embedding in successful]
                     
-                    # Bulk update using executemany - store ubinary-derived embeddings
+                    # Bulk update using executemany - store float32 embeddings
                     await conn.executemany("""
                         UPDATE unbias.threads
-                        SET blob_embedding_binary = $1::bit(512),
-                            thread_status = 3
+                        SET blob_embedding = $1,
+                            thread_status = 5
                         WHERE hash = $2;
                     """, update_data)
                     
@@ -262,7 +240,7 @@ class ThreadEmbeddingWorker:
             raise
     
     async def mark_failed(self, failed_hashes: List[bytes], status: int = 19):
-        """Mark failed items with status 19 (error) or 1 (retry)"""
+        """Mark failed items with status 19 (error) or 3 (retry)"""
         if not failed_hashes:
             return
         try:
@@ -303,7 +281,7 @@ class ThreadEmbeddingWorker:
                 # Combine all errors into one update
                 all_errors = failed + blank
                 await self.mark_failed(all_errors, status=19)
-                await self.mark_failed(retry, status=1)
+                await self.mark_failed(retry, status=3)  # Reset to status 3 for retry
                 update_time = time.time() - update_start
                 total_update_time += update_time
                 current_batch_hashes = []
@@ -329,7 +307,7 @@ class ThreadEmbeddingWorker:
             if current_batch_hashes:
                 self.logger.warning(f"Worker {self.worker_id} crashed with {len(current_batch_hashes)} items in progress, marking as failed")
                 try:
-                    await self.mark_failed(current_batch_hashes, status=1)
+                    await self.mark_failed(current_batch_hashes, status=3)  # Reset to status 3 for retry
                 except Exception as e:
                     self.logger.error(f"Failed to mark crashed batch as failed: {e}")
 
@@ -337,7 +315,7 @@ class ThreadEmbeddingWorker:
 async def main(args):
     """Main entry point for the threads embedding pipeline"""
     # Initial startup message at INFO level
-    logger.info("Starting threads ubinary embedding pipeline...")
+    logger.info("Starting threads float32 embedding pipeline...")
     start_time = time.time()
     
     # Check for VoyageAI API key
@@ -350,7 +328,7 @@ async def main(args):
         await db.initialize_pool(command_timeout=DB_COMMAND_TIMEOUT)
         
         # Register pgvector extension with all connections in the pool
-        # This is needed for HNSW indexes and Hamming distance operations on binary embeddings
+        # This is needed for vector operations and cosine similarity on float embeddings
         async def setup_pgvector(connection):
             await pgvector.asyncpg.register_vector(connection)
         
@@ -431,7 +409,7 @@ async def main(args):
         total_duration = time.time() - start_time
         total_rows = progress_tracker.total_rows
         rate = total_rows / total_duration if total_duration > 0 else 0
-        logger.info(f"Threads ubinary embedding pipeline completed: {total_rows:,} rows in {total_duration:.1f}s ({rate:.0f} rows/sec)")
+        logger.info(f"Threads float32 embedding pipeline completed: {total_rows:,} rows in {total_duration:.1f}s ({rate:.0f} rows/sec)")
         
     except Exception as e:
         logger.error(f"An error occurred in the main workflow: {e}", exc_info=True)
@@ -443,7 +421,7 @@ async def main(args):
 
 def parse_args():
     """Parse command line arguments"""
-    parser = argparse.ArgumentParser(description='Thread Embedding Batch Processor')
+    parser = argparse.ArgumentParser(description='Thread Float32 Embedding Batch Processor')
     parser.add_argument('--batch-size', type=int, default=DEFAULT_BATCH_SIZE,
                        help=f'Number of texts per batch (default: {DEFAULT_BATCH_SIZE}, max: 1000 per Voyage API)')
     parser.add_argument('--max-batches', type=int, default=DEFAULT_MAX_BATCHES,
@@ -457,4 +435,4 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    asyncio.run(main(args))
+    asyncio.run(main(args)) 
