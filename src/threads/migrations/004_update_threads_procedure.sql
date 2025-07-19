@@ -1,5 +1,5 @@
 CREATE OR REPLACE PROCEDURE nindexer.process_casts(
-    p_batch_size   int  DEFAULT 100000,
+    p_batch_size   int  DEFAULT 200000,
     p_max_batches  int  DEFAULT NULL          -- NULL = run to completion
 )
 LANGUAGE plpgsql

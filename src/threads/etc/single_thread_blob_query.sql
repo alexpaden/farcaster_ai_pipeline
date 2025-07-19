@@ -9,7 +9,7 @@ WITH config AS (
     SELECT 20 AS min_reply_length
 ),
 target_thread AS (
-    SELECT decode('e7126eb73294f4d3014f657d2de26dce4203d0bb','hex') AS hash
+    SELECT decode('DC8FD3E4047AD9BFC556EB4ACAAFBB86EE9C4C81','hex') AS hash
 ),
 
 -- Check thread size
@@ -370,28 +370,40 @@ final_quote_text AS MATERIALIZED (
   ORDER BY hash
 ),
 
--- Build sorted thread
+-- Build sorted thread with proper parent-child nesting
 sorted_thread AS MATERIALIZED (
-  WITH RECURSIVE ordered_build AS (
-    -- Root
-    SELECT
+  WITH sibling_order AS (
+    -- First, assign sibling order based on popularity
+    SELECT 
       wp.*,
-      ARRAY[LPAD(TO_CHAR(999999999 - COALESCE(wp.max_subtree_popularity, 0), 'FM000000000'), 9, '0')] AS sort_path,
+      ROW_NUMBER() OVER (
+        PARTITION BY COALESCE(wp.parent_hash, '\x00'::bytea) 
+        ORDER BY wp.max_subtree_popularity DESC NULLS LAST, wp.hash
+      ) AS sibling_rank,
       COALESCE(fqt.hydrated_text, wp.text) AS final_text
     FROM with_popularity wp
     LEFT JOIN final_quote_text fqt ON fqt.hash = wp.hash
-    WHERE wp.parent_hash IS NULL
-    
-    UNION ALL
-    
-    -- Children
-    SELECT
-      child.*,
-      parent.sort_path || LPAD(TO_CHAR(999999999 - COALESCE(child.max_subtree_popularity, 0), 'FM000000000'), 9, '0'),
-      COALESCE(fqt.hydrated_text, child.text)
-    FROM with_popularity child
-    JOIN ordered_build parent ON child.parent_hash = parent.hash
-    LEFT JOIN final_quote_text fqt ON fqt.hash = child.hash
+  ),
+  ordered_build AS (
+    -- Build paths using recursive CTE
+    WITH RECURSIVE path_builder AS (
+      -- Root
+      SELECT
+        so.*,
+        ARRAY[LPAD(so.sibling_rank::text, 9, '0')] AS sort_path
+      FROM sibling_order so
+      WHERE so.parent_hash IS NULL
+      
+      UNION ALL
+      
+      -- Children - append sibling rank to parent's path
+      SELECT
+        child.*,
+        parent.sort_path || LPAD(child.sibling_rank::text, 9, '0')
+      FROM sibling_order child
+      JOIN path_builder parent ON child.parent_hash = parent.hash
+    )
+    SELECT * FROM path_builder
   )
   SELECT * FROM ordered_build
 )
