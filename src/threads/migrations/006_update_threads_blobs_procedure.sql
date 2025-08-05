@@ -1,5 +1,5 @@
 CREATE OR REPLACE PROCEDURE unbias.process_thread_blobs_batch(
-    p_batch_size   int DEFAULT 10,
+    p_batch_size   int DEFAULT 100000,
     p_max_batches  int DEFAULT NULL          -- NULL = run to completion
 )
 LANGUAGE plpgsql
