@@ -41,11 +41,13 @@ SELECT
     reactions, 
     author_fid, 
     "timestamp", 
-    claimed_at, 
-    "blob", 
-    blob_embedding
+    tokens,
+    blob_timestamp, 
+    "blob",
+    blob_embedding,
+    blob_embedding_binary
 FROM unbias.threads
-WHERE threads_status = 3 AND spam = 2
+WHERE thread_status = 5 AND spam = 2
 ORDER BY timestamp
 """
 
@@ -55,7 +57,7 @@ async def get_total_row_count(conn):
     count_query = """
     SELECT COUNT(*)
     FROM unbias.threads
-    WHERE threads_status = 3 AND spam = 2
+    WHERE thread_status = 5 AND spam = 2
     """
     result = await conn.fetchval(count_query)
     return result
@@ -117,7 +119,13 @@ async def export_to_parquet():
                     
                     # Convert rows to list of dicts for pandas
                     t2 = time.time()
-                    data = [dict(row) for row in rows]
+                    data = []
+                    for row in rows:
+                        row_dict = dict(row)
+                        # Convert BitString to bytes for blob_embedding_binary
+                        if 'blob_embedding_binary' in row_dict and row_dict['blob_embedding_binary'] is not None:
+                            row_dict['blob_embedding_binary'] = bytes(row_dict['blob_embedding_binary'])
+                        data.append(row_dict)
                     df = pd.DataFrame(data)
                     t3 = time.time()
                     logger.info(f"DataFrame construction took {t3-t2:.2f} seconds")
